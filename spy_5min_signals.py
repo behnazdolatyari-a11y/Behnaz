@@ -48,6 +48,8 @@ USE_ATR_STOPS = False         # False = score a signal purely on "did price go t
 ATR_STOP_MULT = 1.0           # stop distance = 1.0 x ATR
 ATR_TARGET_MULT = 1.5         # target distance = 1.5 x ATR
 
+DROP_INCOMPLETE_BAR = True    # ignore the still-forming candle — see drop_incomplete_bar()
+
 # ---- Chart ----
 CHART_DAYS = 21               # trading days of history drawn on the signal chart (~1 month)
 
@@ -61,7 +63,28 @@ FEATURE_COLS = [
 ]
 
 
-def fetch_data(symbol=SYMBOL, interval=INTERVAL, period=PERIOD):
+def interval_minutes(interval=INTERVAL):
+    return int("".join(ch for ch in interval if ch.isdigit()) or 5)
+
+
+def drop_incomplete_bar(df, interval=INTERVAL):
+    """Drops the final candle while it is still forming.
+
+    This matters a lot if you re-run during the session. Fetch at 10:32 and the
+    10:30 bar holds only two minutes of trading — its high/low/close, and every
+    indicator built on them, will change by 10:35. Signals computed on that
+    half-built candle flip or vanish on the next refresh, which looks exactly like
+    the tool contradicting itself. Waiting for the bar to close costs up to five
+    minutes of latency and buys a signal that won't be retracted."""
+    if df.empty:
+        return df
+    bar_close = df.index[-1] + pd.Timedelta(minutes=interval_minutes(interval))
+    if pd.Timestamp.now(tz=df.index.tz) < bar_close:
+        return df.iloc[:-1]
+    return df
+
+
+def fetch_data(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, drop_partial=DROP_INCOMPLETE_BAR):
     df = yf.download(symbol, interval=interval, period=period, progress=False, auto_adjust=False)
     if df.empty:
         raise ValueError("No data returned — market may be closed, symbol invalid, or rate-limited.")
@@ -72,6 +95,8 @@ def fetch_data(symbol=SYMBOL, interval=INTERVAL, period=PERIOD):
         df = df.tz_localize("UTC")
     df = df.tz_convert("America/New_York")
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if drop_partial:
+        df = drop_incomplete_bar(df, interval)
     return df
 
 
