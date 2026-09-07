@@ -49,6 +49,15 @@ ATR_STOP_MULT = 1.0           # stop distance = 1.0 x ATR
 ATR_TARGET_MULT = 1.5         # target distance = 1.5 x ATR
 
 DROP_INCOMPLETE_BAR = True    # ignore the still-forming candle — see drop_incomplete_bar()
+CONFLICT_MAX = 0.35           # veto a signal when the opposing evidence is more than this
+                              # fraction of the supporting evidence. Summing votes hid the
+                              # difference between "+5, nothing against" and "+6 vs -1"; on real
+                              # SPY data ~1 in 4 signals fired while its own indicators disagreed
+                              # (BUYs on RSI 84, SELLs citing a confirmed Double Bottom).
+AVOID_OVERNIGHT = True        # don't fire a signal whose exit would land past the closing bell.
+                              # A 30-minute horizon starting at 15:55 is really an overnight hold:
+                              # in the live run those 5 trades produced both the biggest loss
+                              # (-0.64%) and the 2nd biggest win (+0.55%) — gap variance, not edge.
 
 # ---- Chart ----
 CHART_DAYS = 21               # trading days of history drawn on the signal chart (~1 month)
@@ -59,7 +68,7 @@ FEATURE_COLS = [
     "resistance_break", "support_break", "classic_bull", "classic_bear", "harmonic_bull",
     "harmonic_bear", "rule_score",
     "ret_1", "ret_3", "ret_6", "ret_12", "realized_vol_12", "minutes_since_open",
-    "adx", "di_spread",
+    "adx", "di_spread", "conflict", "bull_pts", "bear_pts",
 ]
 
 
@@ -160,6 +169,40 @@ def add_indicators(df):
     tpv = typical * df["Volume"]
     df["VWAP"] = tpv.groupby(session_date).cumsum() / df["Volume"].groupby(session_date).cumsum()
 
+    return df
+
+
+def add_session_guard(df, horizon=FORWARD_HORIZON, interval=INTERVAL):
+    """Flags bars whose `horizon`-bar exit would fall past that session's last bar.
+
+    A 6-bar (30-minute) horizon starting at 15:55 doesn't exit 30 minutes later —
+    it exits at tomorrow's open, straight through the overnight gap. That's a
+    different trade with different risk, and in the live run those few trades
+    supplied both the largest loss and the second-largest win: pure gap variance
+    dressed up as signal performance.
+
+    This looks only at the clock, never at future prices, so it introduces no
+    lookahead — at 15:55 you already know the 6th bar from now is tomorrow. The
+    per-session last bar is measured from the data, so half-days are handled; the
+    final session is usually still in progress, so it borrows the typical close
+    rather than mistaking "the day isn't over yet" for an early close."""
+    df = df.copy()
+    if df.empty:
+        df["SpansClose"] = False
+        return df
+
+    mins = interval_minutes(interval)
+    bar_minute = pd.Series(df.index.hour * 60 + df.index.minute, index=df.index)
+    session = pd.Series(df.index.normalize(), index=df.index)
+
+    per_session_last = bar_minute.groupby(session).max()
+    typical_last = int(per_session_last.median())
+    # The newest session may be mid-flight; don't let its partial data look like an early close.
+    newest = per_session_last.index[-1]
+    per_session_last.loc[newest] = max(per_session_last.loc[newest], typical_last)
+
+    last_bar_minute = session.map(per_session_last)
+    df["SpansClose"] = (bar_minute + horizon * mins) > last_bar_minute
     return df
 
 
@@ -342,34 +385,39 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
                      classic_patterns, harmonic_patterns):
     """Scores the LAST bar of `df` and also returns a dict of numeric features
     describing that same bar — the features feed the ML model below, while the
-    score/reasons remain a fully human-readable rule-based opinion on their own."""
+    score/reasons remain a fully human-readable rule-based opinion on their own.
+
+    Every piece of evidence is recorded as a separate signed vote rather than
+    being added straight into a running total. Summing immediately destroys the
+    distinction between "+5 with nothing against it" and "+6 against -1", which
+    are very different situations: the second one means the indicators disagree.
+    Keeping the votes lets `conflict` below measure that disagreement."""
     last = df.iloc[-1]
     n = len(df) - 1
-    score = 0
-    reasons = []
+    votes = []          # (points, reason) — positive = bullish, negative = bearish
     feat = {}
 
     ema_stack = 0
     if last["EMA9"] > last["EMA21"] > last["EMA50"]:
-        score += 2; reasons.append("EMA9 > EMA21 > EMA50 (uptrend)"); ema_stack = 1
+        votes.append((2, "EMA9 > EMA21 > EMA50 (uptrend)")); ema_stack = 1
     elif last["EMA9"] < last["EMA21"] < last["EMA50"]:
-        score -= 2; reasons.append("EMA9 < EMA21 < EMA50 (downtrend)"); ema_stack = -1
+        votes.append((-2, "EMA9 < EMA21 < EMA50 (downtrend)")); ema_stack = -1
     feat["ema_stack"] = ema_stack
     feat["ema9_21_pct"] = (last["EMA9"] - last["EMA21"]) / last["Close"]
     feat["ema21_50_pct"] = (last["EMA21"] - last["EMA50"]) / last["Close"]
 
     macd_bias = 0
     if last["MACD"] > last["MACD_signal"] and last["MACD_hist"] > 0:
-        score += 1; reasons.append("MACD bullish crossover"); macd_bias = 1
+        votes.append((1, "MACD bullish crossover")); macd_bias = 1
     elif last["MACD"] < last["MACD_signal"] and last["MACD_hist"] < 0:
-        score -= 1; reasons.append("MACD bearish crossover"); macd_bias = -1
+        votes.append((-1, "MACD bearish crossover")); macd_bias = -1
     feat["macd_bias"] = macd_bias
     feat["macd_hist_pct"] = last["MACD_hist"] / last["Close"]
 
     if last["RSI"] < 30:
-        score += 1; reasons.append(f"RSI oversold ({last['RSI']:.1f})")
+        votes.append((1, f"RSI oversold ({last['RSI']:.1f})"))
     elif last["RSI"] > 70:
-        score -= 1; reasons.append(f"RSI overbought ({last['RSI']:.1f})")
+        votes.append((-1, f"RSI overbought ({last['RSI']:.1f})"))
     feat["rsi"] = last["RSI"]
 
     # VWAP only votes when price is meaningfully away from it. Previously this was a
@@ -377,17 +425,17 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
     # rest, which is a big part of why marginal setups kept crossing the threshold.
     vwap_diff_pct = (last["Close"] - last["VWAP"]) / last["VWAP"]
     if vwap_diff_pct > VWAP_NEUTRAL_BAND:
-        score += 1; reasons.append(f"Price {vwap_diff_pct * 100:.2f}% above VWAP")
+        votes.append((1, f"Price {vwap_diff_pct * 100:.2f}% above VWAP"))
     elif vwap_diff_pct < -VWAP_NEUTRAL_BAND:
-        score -= 1; reasons.append(f"Price {abs(vwap_diff_pct) * 100:.2f}% below VWAP")
+        votes.append((-1, f"Price {abs(vwap_diff_pct) * 100:.2f}% below VWAP"))
     feat["vwap_diff_pct"] = vwap_diff_pct
 
     bb_range = last["BB_upper"] - last["BB_lower"]
     feat["bb_pct"] = (last["Close"] - last["BB_mid"]) / bb_range if bb_range > 0 else 0.0
     if last["Close"] <= last["BB_lower"]:
-        score += 1; reasons.append("Price at/below lower Bollinger Band")
+        votes.append((1, "Price at/below lower Bollinger Band"))
     elif last["Close"] >= last["BB_upper"]:
-        score -= 1; reasons.append("Price at/above upper Bollinger Band")
+        votes.append((-1, "Price at/above upper Bollinger Band"))
 
     feat["atr_pct"] = last["ATR"] / last["Close"]
     feat["vol_ratio"] = (last["Volume"] / last["VolSMA20"]) if last["VolSMA20"] > 0 else 1.0
@@ -398,23 +446,23 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
     feat["dist_resistance_pct"] = min(resistance_dists) if resistance_dists else np.nan
     for lvl in support:
         if abs(last["Close"] - lvl["price"]) / lvl["price"] <= 0.002:
-            score += 1; reasons.append(f"Near support {lvl['price']:.2f}")
+            votes.append((1, f"Near support {lvl['price']:.2f}"))
     for lvl in resistance:
         if abs(last["Close"] - lvl["price"]) / lvl["price"] <= 0.002:
-            score -= 1; reasons.append(f"Near resistance {lvl['price']:.2f}")
+            votes.append((-1, f"Near resistance {lvl['price']:.2f}"))
 
     resistance_break = 0
     if resistance_line is not None:
         r_val = resistance_line[0] * n + resistance_line[1]
         if last["Close"] > r_val:
-            score += 2; reasons.append("Breakout above resistance trend line"); resistance_break = 1
+            votes.append((2, "Breakout above resistance trend line")); resistance_break = 1
     feat["resistance_break"] = resistance_break
 
     support_break = 0
     if support_line is not None:
         s_val = support_line[0] * n + support_line[1]
         if last["Close"] < s_val:
-            score -= 2; reasons.append("Breakdown below support trend line"); support_break = 1
+            votes.append((-2, "Breakdown below support trend line")); support_break = 1
     feat["support_break"] = support_break
 
     classic_bull = 0
@@ -422,9 +470,9 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
     for pat in classic_patterns:
         if pat.get("confirmed"):
             if pat["bias"] == "bullish":
-                score += 2; reasons.append(f"{pat['pattern']} confirmed (bullish)"); classic_bull = 1
+                votes.append((2, f"{pat['pattern']} confirmed (bullish)")); classic_bull = 1
             elif pat["bias"] == "bearish":
-                score -= 2; reasons.append(f"{pat['pattern']} confirmed (bearish)"); classic_bear = 1
+                votes.append((-2, f"{pat['pattern']} confirmed (bearish)")); classic_bear = 1
     feat["classic_bull"] = classic_bull
     feat["classic_bear"] = classic_bear
 
@@ -433,12 +481,11 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
     for pat in harmonic_patterns:
         if abs(pat["D_index"] - n) <= 3:
             if pat["bias"] == "bullish":
-                score += 3; reasons.append(f"{pat['pattern']} harmonic bullish completion at D"); harmonic_bull = 1
+                votes.append((3, f"{pat['pattern']} harmonic bullish completion at D")); harmonic_bull = 1
             else:
-                score -= 3; reasons.append(f"{pat['pattern']} harmonic bearish completion at D"); harmonic_bear = 1
+                votes.append((-3, f"{pat['pattern']} harmonic bearish completion at D")); harmonic_bear = 1
     feat["harmonic_bull"] = harmonic_bull
     feat["harmonic_bear"] = harmonic_bear
-    feat["rule_score"] = score
 
     # ---- Momentum / volatility / time-of-day features (for the ML model) ----
     closes = df["Close"]
@@ -457,6 +504,19 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
     feat["minutes_since_open"] = (ts.hour * 60 + ts.minute) - (9 * 60 + 30)
     feat["adx"] = last["ADX"]
     feat["di_spread"] = last["PlusDI"] - last["MinusDI"]
+
+    # ---- Tally the votes, and measure how much they disagree ----
+    score = sum(p for p, _ in votes)
+    reasons = [r for _, r in votes]
+    bull_pts = sum(p for p, _ in votes if p > 0)
+    bear_pts = -sum(p for p, _ in votes if p < 0)
+    strong, weak = max(bull_pts, bear_pts), min(bull_pts, bear_pts)
+    # 0.0 = every indicator agrees, 1.0 = evidence is evenly split against itself.
+    conflict = (weak / strong) if strong > 0 else 0.0
+    feat["conflict"] = conflict
+    feat["bull_pts"] = bull_pts
+    feat["bear_pts"] = bear_pts
+    feat["rule_score"] = score
 
     if score >= 4:
         signal = "STRONG BUY"
@@ -587,18 +647,26 @@ def add_ml_predictions(df, model, feature_cols=FEATURE_COLS):
     return df
 
 
-def combine_rule_and_ml(df, ml_weight=ML_WEIGHT, threshold=SIGNAL_THRESHOLD, adx_min=ADX_MIN):
+def combine_rule_and_ml(df, ml_weight=ML_WEIGHT, threshold=SIGNAL_THRESHOLD, adx_min=ADX_MIN,
+                         conflict_max=CONFLICT_MAX, avoid_overnight=AVOID_OVERNIGHT):
     """Final score = rule-engine score, nudged by how strongly the ML model leans
     up vs. down (scaled to roughly the same range as the rule score). This is
     additive, not an all-or-nothing gate: a strong rule signal can still fire even
     if the model is lukewarm, and vice versa.
 
-    Two noise filters sit on top:
-      * `threshold` — how far from zero the score must get before anything fires.
-      * `adx_min`   — when ADX says the tape is ranging rather than trending, every
-                      signal is suppressed. Chop is where trend-following rules
-                      generate their worst false positives, so this cuts a whole
-                      class of bad signals rather than trying to out-vote them."""
+    Three vetoes sit on top. Each removes a whole class of bad signal rather than
+    trying to out-vote it, and each records why, so a suppressed bar can be
+    explained instead of just silently going quiet:
+
+      * `adx_min`       — the tape is ranging, not trending. Chop is where
+                          trend-following rules produce their worst false positives.
+      * `conflict_max`  — the indicators contradict each other. A +6/-1 split nets
+                          to the same +5 as unanimous agreement, but means something
+                          entirely different; this refuses to trade the disagreement.
+      * `avoid_overnight` — the exit would land past the closing bell, turning a
+                          30-minute trade into an overnight gap bet.
+
+    `threshold` still sets how far from zero the score must travel to fire at all."""
     df = df.copy()
     conviction = df["P_up"].fillna(0) - df["P_down"].fillna(0)
     df["Conviction"] = conviction
@@ -607,8 +675,18 @@ def combine_rule_and_ml(df, ml_weight=ML_WEIGHT, threshold=SIGNAL_THRESHOLD, adx
     adx = df["ADX"].fillna(0) if "ADX" in df.columns else pd.Series(100.0, index=df.index)
     df["Choppy"] = adx < adx_min
 
-    def classify(s, choppy):
-        if pd.isna(s) or choppy:
+    conflict = df["conflict"].fillna(0) if "conflict" in df.columns else pd.Series(0.0, index=df.index)
+    df["Conflicted"] = conflict > conflict_max
+
+    if avoid_overnight and "SpansClose" in df.columns:
+        df["Overnight"] = df["SpansClose"].fillna(False)
+    else:
+        df["Overnight"] = False
+
+    df["Vetoed"] = df["Choppy"] | df["Conflicted"] | df["Overnight"]
+
+    def classify(s, vetoed):
+        if pd.isna(s) or vetoed:
             return "HOLD"
         if s >= threshold * 2:
             return "STRONG BUY"
@@ -620,8 +698,35 @@ def combine_rule_and_ml(df, ml_weight=ML_WEIGHT, threshold=SIGNAL_THRESHOLD, adx
             return "SELL"
         return "HOLD"
 
-    df["FinalSignal"] = [classify(s, c) for s, c in zip(df["FinalScore"], df["Choppy"])]
+    df["FinalSignal"] = [classify(s, v) for s, v in zip(df["FinalScore"], df["Vetoed"])]
     return df
+
+
+def classify_raw(score, threshold=SIGNAL_THRESHOLD):
+    """What the score alone would have called, ignoring the vetoes."""
+    if pd.isna(score):
+        return "HOLD"
+    if score >= threshold * 2:
+        return "STRONG BUY"
+    if score >= threshold:
+        return "BUY"
+    if score <= -threshold * 2:
+        return "STRONG SELL"
+    if score <= -threshold:
+        return "SELL"
+    return "HOLD"
+
+
+def veto_reason(row):
+    """Which guard (if any) is holding a signal back on this bar."""
+    if row.get("Choppy", False):
+        return f"ADX {row.get('ADX', float('nan')):.0f} — tape is ranging, not trending"
+    if row.get("Conflicted", False):
+        return (f"indicators disagree — {row.get('bull_pts', 0):.0f} points bullish vs "
+                f"{row.get('bear_pts', 0):.0f} bearish (conflict {row.get('conflict', 0):.2f})")
+    if row.get("Overnight", False):
+        return "exit would fall past the closing bell — that's an overnight gap bet"
+    return ""
 
 
 def add_arrow_markers(df, signal_col="FinalSignal", cooldown_bars=COOLDOWN_BARS):
@@ -1015,6 +1120,7 @@ def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, ver
                   run_walk_forward=True, ml_weight=ML_WEIGHT, tune=True):
     raw = fetch_data(symbol, interval, period)
     raw = add_indicators(raw)
+    raw = add_session_guard(raw)
     full = compute_signal_history(raw)
     full = add_forward_labels(full)
 
@@ -1118,8 +1224,9 @@ def print_current_signal(full, symbol=SYMBOL):
     last = full.iloc[-1]
     print(f"{symbol} | {full.index[-1]} | Last Close: {last['Close']:.2f}")
     state = last["FinalSignal"]
-    if last.get("Choppy", False):
-        state += "  (suppressed: ADX %.0f says the tape is ranging)" % last["ADX"]
+    reason = veto_reason(last)
+    if reason:
+        state += f"  (would be {classify_raw(last['FinalScore'])}, vetoed: {reason})"
     print(f"SIGNAL: {state}  (score {last['FinalScore']:+.1f} = rule {last['Score']:+.0f} + ML {last['Conviction']:+.2f}, "
           f"P(up)={last['P_up']:.2f}, P(down)={last['P_down']:.2f})")
     if last["Reasons"]:
@@ -1141,6 +1248,7 @@ def refresh_and_chart(model, symbol=SYMBOL, interval=INTERVAL, period=PERIOD,
     and backtest, which don't change meaningfully every 5 minutes anyway."""
     raw = fetch_data(symbol, interval, period)
     raw = add_indicators(raw)
+    raw = add_session_guard(raw)
     full = compute_signal_history(raw)
     full = add_ml_predictions(full, model)
     full = combine_rule_and_ml(full, ml_weight)
