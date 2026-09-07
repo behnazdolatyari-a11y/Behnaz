@@ -33,12 +33,31 @@ ML_WEIGHT = 1.0               # how much the ML model's opinion counts vs. the r
 RANDOM_STATE = 42
 N_FOLDS = 4                   # walk-forward validation folds
 
+# ---- Noise filters (these exist to cut down false signals) ----
+SIGNAL_THRESHOLD = 4          # |final score| needed to fire a signal. Raised from 2: being pickier
+                              # is the most direct lever against "too many wrong signals". Run
+                              # tune_filters() on your own data and set this from the results.
+COOLDOWN_BARS = 6             # min bars between consecutive signals, kills whipsaw repeats
+ADX_MIN = 20                  # below this the market is ranging/choppy -> suppress signals entirely
+VWAP_NEUTRAL_BAND = 0.0005    # price must sit >0.05% away from VWAP before VWAP votes either way
+USE_ATR_STOPS = False         # False = score a signal purely on "did price go the way it said"
+                              # (that's what 'wrong signal' means). Set True to add a 1xATR stop /
+                              # 1.5xATR target instead — more realistic risk management, but a stop
+                              # nearer than the target mechanically LOWERS the win rate while making
+                              # the winners bigger, so don't compare the two modes' win rates directly.
+ATR_STOP_MULT = 1.0           # stop distance = 1.0 x ATR
+ATR_TARGET_MULT = 1.5         # target distance = 1.5 x ATR
+
+# ---- Chart ----
+CHART_DAYS = 21               # trading days of history drawn on the signal chart (~1 month)
+
 FEATURE_COLS = [
     "ema_stack", "ema9_21_pct", "ema21_50_pct", "macd_bias", "macd_hist_pct", "rsi",
     "vwap_diff_pct", "bb_pct", "atr_pct", "vol_ratio", "dist_support_pct", "dist_resistance_pct",
     "resistance_break", "support_break", "classic_bull", "classic_bear", "harmonic_bull",
     "harmonic_bear", "rule_score",
     "ret_1", "ret_3", "ret_6", "ret_12", "realized_vol_12", "minutes_since_open",
+    "adx", "di_spread",
 ]
 
 
@@ -89,6 +108,22 @@ def add_indicators(df):
     low_close = (df["Low"] - df["Close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+
+    # ADX / directional index — measures how *trending* vs. *choppy* the tape is.
+    # Most false intraday signals come from firing inside a sideways range, so this
+    # is what the chop filter keys off of.
+    up_move = df["High"].diff()
+    down_move = -df["Low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    atr_for_di = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_for_di
+    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_for_di
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    df["PlusDI"] = plus_di.fillna(0)
+    df["MinusDI"] = minus_di.fillna(0)
+    df["ADX"] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0)
 
     df["VolSMA20"] = df["Volume"].rolling(20).mean()
 
@@ -312,11 +347,15 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
         score -= 1; reasons.append(f"RSI overbought ({last['RSI']:.1f})")
     feat["rsi"] = last["RSI"]
 
-    if last["Close"] > last["VWAP"]:
-        score += 1; reasons.append("Price above VWAP")
-    else:
-        score -= 1; reasons.append("Price below VWAP")
-    feat["vwap_diff_pct"] = (last["Close"] - last["VWAP"]) / last["VWAP"]
+    # VWAP only votes when price is meaningfully away from it. Previously this was a
+    # bare if/else, so it added +1 or -1 on EVERY bar — the score could never sit at
+    # rest, which is a big part of why marginal setups kept crossing the threshold.
+    vwap_diff_pct = (last["Close"] - last["VWAP"]) / last["VWAP"]
+    if vwap_diff_pct > VWAP_NEUTRAL_BAND:
+        score += 1; reasons.append(f"Price {vwap_diff_pct * 100:.2f}% above VWAP")
+    elif vwap_diff_pct < -VWAP_NEUTRAL_BAND:
+        score -= 1; reasons.append(f"Price {abs(vwap_diff_pct) * 100:.2f}% below VWAP")
+    feat["vwap_diff_pct"] = vwap_diff_pct
 
     bb_range = last["BB_upper"] - last["BB_lower"]
     feat["bb_pct"] = (last["Close"] - last["BB_mid"]) / bb_range if bb_range > 0 else 0.0
@@ -391,6 +430,8 @@ def generate_signal(df, support, resistance, support_line, resistance_line,
 
     ts = last.name
     feat["minutes_since_open"] = (ts.hour * 60 + ts.minute) - (9 * 60 + 30)
+    feat["adx"] = last["ADX"]
+    feat["di_spread"] = last["PlusDI"] - last["MinusDI"]
 
     if score >= 4:
         signal = "STRONG BUY"
@@ -521,73 +562,175 @@ def add_ml_predictions(df, model, feature_cols=FEATURE_COLS):
     return df
 
 
-def combine_rule_and_ml(df, ml_weight=ML_WEIGHT):
+def combine_rule_and_ml(df, ml_weight=ML_WEIGHT, threshold=SIGNAL_THRESHOLD, adx_min=ADX_MIN):
     """Final score = rule-engine score, nudged by how strongly the ML model leans
     up vs. down (scaled to roughly the same range as the rule score). This is
     additive, not an all-or-nothing gate: a strong rule signal can still fire even
-    if the model is lukewarm, and vice versa — they reinforce or partially cancel
-    each other rather than one vetoing the other outright."""
+    if the model is lukewarm, and vice versa.
+
+    Two noise filters sit on top:
+      * `threshold` — how far from zero the score must get before anything fires.
+      * `adx_min`   — when ADX says the tape is ranging rather than trending, every
+                      signal is suppressed. Chop is where trend-following rules
+                      generate their worst false positives, so this cuts a whole
+                      class of bad signals rather than trying to out-vote them."""
     df = df.copy()
     conviction = df["P_up"].fillna(0) - df["P_down"].fillna(0)
     df["Conviction"] = conviction
     df["FinalScore"] = df["Score"].fillna(0) + ml_weight * conviction * 10
 
-    def classify(s):
-        if pd.isna(s):
+    adx = df["ADX"].fillna(0) if "ADX" in df.columns else pd.Series(100.0, index=df.index)
+    df["Choppy"] = adx < adx_min
+
+    def classify(s, choppy):
+        if pd.isna(s) or choppy:
             return "HOLD"
-        if s >= 4:
+        if s >= threshold * 2:
             return "STRONG BUY"
-        if s >= 2:
+        if s >= threshold:
             return "BUY"
-        if s <= -4:
+        if s <= -threshold * 2:
             return "STRONG SELL"
-        if s <= -2:
+        if s <= -threshold:
             return "SELL"
         return "HOLD"
 
-    df["FinalSignal"] = df["FinalScore"].apply(classify)
+    df["FinalSignal"] = [classify(s, c) for s, c in zip(df["FinalScore"], df["Choppy"])]
     return df
 
 
-def add_arrow_markers(df, signal_col="FinalSignal"):
-    """Marks only the bar where a signal *first* turns BUY or SELL, so arrows show
-    up once per move instead of on every bar the condition holds."""
+def add_arrow_markers(df, signal_col="FinalSignal", cooldown_bars=COOLDOWN_BARS):
+    """Marks the bar where a signal *first* turns BUY or SELL, then refuses to mark
+    another one for `cooldown_bars` afterwards.
+
+    Without the cooldown, a score hovering right at the threshold flips
+    HOLD->BUY->HOLD->BUY repeatedly through a single choppy stretch and paints a
+    cluster of arrows that are really just one (bad) idea repeated. The cooldown
+    is applied here, and the backtest reads these same columns, so what you see on
+    the chart is exactly what gets scored."""
     df = df.copy()
     buy_states = {"BUY", "STRONG BUY"}
     sell_states = {"SELL", "STRONG SELL"}
     prev_signal = df[signal_col].shift(1).fillna("HOLD")
-    df["BuyArrow"] = df[signal_col].isin(buy_states) & ~prev_signal.isin(buy_states)
-    df["SellArrow"] = df[signal_col].isin(sell_states) & ~prev_signal.isin(sell_states)
+    raw_buy = (df[signal_col].isin(buy_states) & ~prev_signal.isin(buy_states)).values
+    raw_sell = (df[signal_col].isin(sell_states) & ~prev_signal.isin(sell_states)).values
+
+    buy_arrow = np.zeros(len(df), dtype=bool)
+    sell_arrow = np.zeros(len(df), dtype=bool)
+    last_fired = -10 ** 9
+    for i in range(len(df)):
+        if not (raw_buy[i] or raw_sell[i]):
+            continue
+        if i - last_fired < cooldown_bars:
+            continue
+        if raw_buy[i]:
+            buy_arrow[i] = True
+        else:
+            sell_arrow[i] = True
+        last_fired = i
+
+    df["BuyArrow"] = buy_arrow
+    df["SellArrow"] = sell_arrow
     return df
 
 
-def backtest_signals(df, test_idx, horizon=FORWARD_HORIZON, signal_col="FinalSignal"):
-    """For every fresh BUY/SELL arrow in the test period, simulate entering at
-    that bar's close and exiting `horizon` bars later. SELL trades are scored as
-    if shorting — a simplification, since SPY shorting in practice usually means
-    an inverse ETF or options."""
+def simulate_trade(df, i, direction, horizon=FORWARD_HORIZON, use_atr_stops=USE_ATR_STOPS,
+                    atr_stop_mult=ATR_STOP_MULT, atr_target_mult=ATR_TARGET_MULT):
+    """Walks a single trade forward from bar `i` and returns how it actually ended.
+
+    With ATR stops on, the trade exits at whichever comes first: stop hit, target
+    hit, or `horizon` bars elapsed. When a bar's range covers both the stop and the
+    target we assume the stop filled first — pessimistic, but the alternative
+    flatters the backtest with fills we can't prove happened in that order."""
+    n = len(df)
+    if i >= n - 1:
+        return None
+
+    entry_price = float(df["Close"].iloc[i])
+    atr = float(df["ATR"].iloc[i]) if not pd.isna(df["ATR"].iloc[i]) else 0.0
+    last_i = min(i + horizon, n - 1)
+
+    if use_atr_stops and atr > 0:
+        if direction == "LONG":
+            stop = entry_price - atr_stop_mult * atr
+            target = entry_price + atr_target_mult * atr
+        else:
+            stop = entry_price + atr_stop_mult * atr
+            target = entry_price - atr_target_mult * atr
+
+        for j in range(i + 1, last_i + 1):
+            bar_high = float(df["High"].iloc[j])
+            bar_low = float(df["Low"].iloc[j])
+            if direction == "LONG":
+                if bar_low <= stop:
+                    return _trade_record(df, i, j, direction, entry_price, stop, "stop")
+                if bar_high >= target:
+                    return _trade_record(df, i, j, direction, entry_price, target, "target")
+            else:
+                if bar_high >= stop:
+                    return _trade_record(df, i, j, direction, entry_price, stop, "stop")
+                if bar_low <= target:
+                    return _trade_record(df, i, j, direction, entry_price, target, "target")
+
+    return _trade_record(df, i, last_i, direction, entry_price, float(df["Close"].iloc[last_i]), "time")
+
+
+def _trade_record(df, i, exit_i, direction, entry_price, exit_price, exit_reason):
+    ret = (exit_price / entry_price - 1) if direction == "LONG" else (entry_price / exit_price - 1)
+    return {"entry_time": df.index[i], "exit_time": df.index[exit_i], "direction": direction,
+            "entry_price": entry_price, "exit_price": exit_price, "exit_reason": exit_reason,
+            "bars_held": exit_i - i, "return_pct": ret * 100}
+
+
+def backtest_signals(df, test_idx, horizon=FORWARD_HORIZON, use_atr_stops=USE_ATR_STOPS):
+    """Scores every arrow inside the test window. Reads the BuyArrow/SellArrow
+    columns produced by add_arrow_markers rather than re-deriving entries, so the
+    backtested trades are exactly the arrows drawn on the chart — otherwise the two
+    code paths can quietly drift apart and the numbers stop describing the picture.
+
+    SELL trades are scored as if shorting is frictionless, which is a
+    simplification: shorting SPY in practice means an inverse ETF or options."""
+    if "BuyArrow" not in df.columns:
+        raise ValueError("Call add_arrow_markers(df) before backtest_signals(df).")
+
     test_df = df.loc[test_idx]
-    buy_states = {"BUY", "STRONG BUY"}
-    sell_states = {"SELL", "STRONG SELL"}
-    prev_signal = test_df[signal_col].shift(1).fillna("HOLD")
-    is_entry = (test_df[signal_col].isin(buy_states) & ~prev_signal.isin(buy_states)) | \
-               (test_df[signal_col].isin(sell_states) & ~prev_signal.isin(sell_states))
-    entries = test_df[is_entry]
+    entries = test_df[test_df["BuyArrow"] | test_df["SellArrow"]]
 
     trades = []
-    n = len(df)
     for ts, row in entries.iterrows():
         i = df.index.get_loc(ts)
-        exit_i = min(i + horizon, n - 1)
-        if exit_i <= i:
-            continue
-        entry_price = df["Close"].iloc[i]
-        exit_price = df["Close"].iloc[exit_i]
-        direction = "LONG" if row[signal_col] in buy_states else "SHORT"
-        ret = (exit_price / entry_price - 1) if direction == "LONG" else (entry_price / exit_price - 1)
-        trades.append({"entry_time": ts, "exit_time": df.index[exit_i], "direction": direction,
-                        "entry_price": entry_price, "exit_price": exit_price, "return_pct": ret * 100})
+        direction = "LONG" if row["BuyArrow"] else "SHORT"
+        trade = simulate_trade(df, i, direction, horizon, use_atr_stops)
+        if trade is not None:
+            trades.append(trade)
     return pd.DataFrame(trades)
+
+
+def add_signal_outcomes(df, horizon=FORWARD_HORIZON, use_atr_stops=USE_ATR_STOPS):
+    """Labels every arrow with how it actually turned out, so the chart can show you
+    which past signals worked and which didn't. Signals too recent to have resolved
+    are marked 'pending' rather than silently counted as anything."""
+    df = df.copy()
+    df["Outcome"] = ""
+    df["OutcomeReturn"] = np.nan
+    df["ExitReason"] = ""
+
+    n = len(df)
+    arrows = df.index[df["BuyArrow"] | df["SellArrow"]]
+    for ts in arrows:
+        i = df.index.get_loc(ts)
+        direction = "LONG" if df["BuyArrow"].iloc[i] else "SHORT"
+        if i + horizon >= n:
+            df.loc[ts, "Outcome"] = "pending"
+            continue
+        trade = simulate_trade(df, i, direction, horizon, use_atr_stops)
+        if trade is None:
+            df.loc[ts, "Outcome"] = "pending"
+            continue
+        df.loc[ts, "Outcome"] = "win" if trade["return_pct"] > 0 else "loss"
+        df.loc[ts, "OutcomeReturn"] = trade["return_pct"]
+        df.loc[ts, "ExitReason"] = trade["exit_reason"]
+    return df
 
 
 def summarize_backtest(trades):
@@ -660,6 +803,49 @@ def walk_forward_evaluate(df, feature_cols=FEATURE_COLS, n_folds=N_FOLDS, embarg
     return results
 
 
+def tune_filters(full, test_idx, ml_weight=ML_WEIGHT, use_atr_stops=USE_ATR_STOPS,
+                  thresholds=(2, 3, 4, 5), adx_mins=(0, 15, 20, 25, 30), cooldowns=(0, 6, 12)):
+    """Sweeps the noise-filter settings and reports what each combination would have
+    done on the held-out period, so you can pick settings from YOUR data instead of
+    trusting defaults someone guessed for you.
+
+    Read it with a sceptical eye: each row is a small sample, so a few percent of
+    win-rate difference between rows is usually noise, not a real edge. Prefer
+    settings that look decent across several neighbouring rows over the single best
+    row, which is probably just the luckiest one."""
+    rows = []
+    for threshold in thresholds:
+        for adx_min in adx_mins:
+            for cooldown in cooldowns:
+                tuned = combine_rule_and_ml(full, ml_weight, threshold=threshold, adx_min=adx_min)
+                tuned = add_arrow_markers(tuned, cooldown_bars=cooldown)
+                trades = backtest_signals(tuned, test_idx, use_atr_stops=use_atr_stops)
+                stats = summarize_backtest(trades)
+                rows.append({
+                    "threshold": threshold, "adx_min": adx_min, "cooldown": cooldown,
+                    "n_trades": stats.get("n_trades", 0),
+                    "win_rate_pct": stats.get("win_rate_pct", np.nan),
+                    "avg_return_pct": stats.get("avg_return_pct", np.nan),
+                    "profit_factor": stats.get("profit_factor", np.nan),
+                })
+    out = pd.DataFrame(rows)
+
+    print("=" * 78)
+    print("Filter tuning on the held-out period (min 20 trades shown, best win rate first)")
+    print("A few % between neighbouring rows is noise — look for a stable neighbourhood,")
+    print("not the single best row.")
+    print("-" * 78)
+    shown = out[out["n_trades"] >= 20].sort_values("win_rate_pct", ascending=False)
+    if shown.empty:
+        print("No setting produced at least 20 trades — loosen the filters or fetch more data.")
+    else:
+        print(shown.head(15).to_string(index=False,
+              formatters={"win_rate_pct": "{:.1f}".format, "avg_return_pct": "{:+.4f}".format,
+                          "profit_factor": "{:.2f}".format}))
+    print("=" * 78)
+    return out
+
+
 def print_backtest_report(trades, stats, label="Backtest"):
     print("-" * 64)
     print(f"{label} — {stats.get('n_trades', 0)} trades")
@@ -704,7 +890,29 @@ def plot_equity_curve(stats, symbol=SYMBOL):
     fig.show()
 
 
-def plot_signals_chart(df, symbol=SYMBOL):
+def _arrow_hover(row, kind):
+    """Hover card for one arrow: when, why, and — for resolved signals — how it went."""
+    parts = [f"<b>{kind}</b>  {row.name:%a %b %d, %H:%M}",
+             f"price {row['Close']:.2f}",
+             f"score {row['FinalScore']:+.1f} (rule {row['Score']:+.0f}, ML {row['Conviction']:+.2f})",
+             f"ADX {row['ADX']:.0f}"]
+    outcome = row.get("Outcome", "")
+    if outcome == "win":
+        parts.append(f"<b>RIGHT</b>: {row['OutcomeReturn']:+.2f}% ({row['ExitReason']})")
+    elif outcome == "loss":
+        parts.append(f"<b>WRONG</b>: {row['OutcomeReturn']:+.2f}% ({row['ExitReason']})")
+    elif outcome == "pending":
+        parts.append("<i>not resolved yet</i>")
+    reasons = row.get("Reasons") or []
+    if len(reasons):
+        parts.append("— " + "<br>— ".join(reasons))
+    return "<br>".join(parts)
+
+
+def plot_signals_chart(df, symbol=SYMBOL, mark_outcomes=True):
+    """Interactive signal chart. Drag to pan, scroll to zoom, use the range buttons
+    or the slider underneath to jump around, and hover any arrow to see why it fired
+    and how it turned out."""
     fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
@@ -712,33 +920,74 @@ def plot_signals_chart(df, symbol=SYMBOL):
         name=symbol, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ))
 
+    has_outcomes = mark_outcomes and "Outcome" in df.columns
+
+    def add_arrows(rows, kind, symbol_shape, base_color, y_values):
+        if not len(rows):
+            return
+        if has_outcomes:
+            # Outline resolved signals by what actually happened, so a month of
+            # history reads as an audit trail rather than just a pile of arrows.
+            line_colors = ["#ffffff" if o == "win" else "#000000" if o == "loss" else "#888888"
+                           for o in rows["Outcome"]]
+            line_widths = [2 if o in ("win", "loss") else 1 for o in rows["Outcome"]]
+        else:
+            line_colors, line_widths = "black", 1
+        fig.add_trace(go.Scatter(
+            x=rows.index, y=y_values, mode="markers", name=kind,
+            marker=dict(symbol=symbol_shape, size=14, color=base_color,
+                         line=dict(width=line_widths, color=line_colors)),
+            text=[_arrow_hover(r, kind) for _, r in rows.iterrows()],
+            hoverinfo="text",
+        ))
+
     buys = df[df["BuyArrow"]]
     sells = df[df["SellArrow"]]
+    add_arrows(buys, "BUY", "triangle-up", "#00e676", buys["Low"] * 0.9985)
+    add_arrows(sells, "SELL", "triangle-down", "#ff1744", sells["High"] * 1.0015)
 
-    if len(buys):
-        fig.add_trace(go.Scatter(
-            x=buys.index, y=buys["Low"] * 0.998, mode="markers", name="BUY",
-            marker=dict(symbol="triangle-up", size=16, color="#00e676", line=dict(width=1, color="black")),
-            text=[f"BUY  conviction {c:+.2f}<br>" + "<br>".join(r) for c, r in zip(buys["Conviction"], buys["Reasons"])],
-            hoverinfo="text+x",
-        ))
-    if len(sells):
-        fig.add_trace(go.Scatter(
-            x=sells.index, y=sells["High"] * 1.002, mode="markers", name="SELL",
-            marker=dict(symbol="triangle-down", size=16, color="#ff1744", line=dict(width=1, color="black")),
-            text=[f"SELL  conviction {c:+.2f}<br>" + "<br>".join(r) for c, r in zip(sells["Conviction"], sells["Reasons"])],
-            hoverinfo="text+x",
-        ))
+    n_days = df.index.normalize().nunique()
+    title = f"{symbol} — 5-Min Signals, last {n_days} trading days"
+    if has_outcomes:
+        resolved = df[df["Outcome"].isin(["win", "loss"])]
+        if len(resolved):
+            hit = (resolved["Outcome"] == "win").mean() * 100
+            title += f"  |  {len(resolved)} resolved signals, {hit:.0f}% went the right way"
+        title += "<br><sub>white outline = worked, black = didn't, grey = too recent to tell</sub>"
 
     fig.update_layout(
-        title=f"{symbol} — 5-Min Candles with Buy/Sell Signals (rule engine + ML, confidence-gated)",
-        xaxis_rangeslider_visible=False, template="plotly_dark", height=650,
+        title=title,
+        template="plotly_dark", height=750,
+        hovermode="closest",
+        dragmode="pan",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=40, r=20, t=110, b=40),
     )
-    fig.show()
+    fig.update_xaxes(
+        rangeslider=dict(visible=True, thickness=0.06),
+        rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1D", step="day", stepmode="backward"),
+                dict(count=3, label="3D", step="day", stepmode="backward"),
+                dict(count=7, label="1W", step="day", stepmode="backward"),
+                dict(count=14, label="2W", step="day", stepmode="backward"),
+                dict(step="all", label="All"),
+            ],
+            bgcolor="#222", activecolor="#00e676", font=dict(color="#eee"), y=1.06,
+        ),
+        # Collapse nights/weekends — without this, a month of 5-minute bars is mostly
+        # empty space and the candles are squeezed into unreadable slivers.
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[16, 9.5], pattern="hour"),
+        ],
+    )
+    fig.update_yaxes(fixedrange=False)
+    fig.show(config={"scrollZoom": True})
 
 
 def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, verbose=True,
-                  run_walk_forward=True, ml_weight=ML_WEIGHT):
+                  run_walk_forward=True, ml_weight=ML_WEIGHT, tune=True):
     raw = fetch_data(symbol, interval, period)
     raw = add_indicators(raw)
     full = compute_signal_history(raw)
@@ -771,6 +1020,7 @@ def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, ver
     full = add_ml_predictions(full, model)
     full = combine_rule_and_ml(full, ml_weight)
     full = add_arrow_markers(full)
+    full = add_signal_outcomes(full)
 
     if verbose:
         print("=" * 64)
@@ -791,23 +1041,66 @@ def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, ver
         print_backtest_report(trades, stats, label=f"Final holdout backtest ({best_name})")
         if plot:
             plot_equity_curve(stats, symbol)
+        if tune:
+            tune_filters(full, test_idx, ml_weight)
 
-    today = full.index[-1].date()
-    day_df = full[full.index.date == today]
+    chart_df = last_n_trading_days(full, CHART_DAYS)
+    print_recent_signals(chart_df)
+    print_current_signal(full, symbol)
 
+    if plot:
+        plot_signals_chart(chart_df, symbol)
+
+    return full, model
+
+
+def last_n_trading_days(df, n_days=CHART_DAYS):
+    """Slice the last `n_days` distinct trading sessions (not calendar days, so
+    weekends and holidays don't eat into the window)."""
+    sessions = sorted(set(df.index.normalize()))
+    if len(sessions) > n_days:
+        cutoff = sessions[-n_days]
+        return df[df.index.normalize() >= cutoff]
+    return df
+
+
+def print_recent_signals(df, max_rows=15):
+    """Prints the most recent signals with how each one resolved, so the numbers in
+    the console line up with the arrows on the chart."""
+    arrows = df[df["BuyArrow"] | df["SellArrow"]]
+    if arrows.empty:
+        print("No signals fired in the charted window.")
+        return
+    resolved = arrows[arrows["Outcome"].isin(["win", "loss"])]
+    print("=" * 78)
+    header = f"Signals in charted window: {len(arrows)}"
+    if len(resolved):
+        hit = (resolved["Outcome"] == "win").mean() * 100
+        avg = resolved["OutcomeReturn"].mean()
+        header += f"  |  {len(resolved)} resolved, {hit:.1f}% right, avg {avg:+.3f}%/signal"
+    print(header)
+    print("-" * 78)
+    print(f"{'time':<18}{'signal':<8}{'price':>9}{'score':>8}{'ADX':>6}{'outcome':>10}{'return':>10}")
+    for ts, row in arrows.tail(max_rows).iterrows():
+        kind = "BUY" if row["BuyArrow"] else "SELL"
+        ret = "" if pd.isna(row["OutcomeReturn"]) else f"{row['OutcomeReturn']:+.2f}%"
+        print(f"{ts:%Y-%m-%d %H:%M}  {kind:<8}{row['Close']:>9.2f}{row['FinalScore']:>8.1f}"
+              f"{row['ADX']:>6.0f}{row['Outcome']:>10}{ret:>10}")
+    print("=" * 78)
+
+
+def print_current_signal(full, symbol=SYMBOL):
     last = full.iloc[-1]
     print(f"{symbol} | {full.index[-1]} | Last Close: {last['Close']:.2f}")
-    print(f"SIGNAL: {last['FinalSignal']}  (conviction {last['Conviction']:+.2f}, rule score {last['Score']}, "
+    state = last["FinalSignal"]
+    if last.get("Choppy", False):
+        state += "  (suppressed: ADX %.0f says the tape is ranging)" % last["ADX"]
+    print(f"SIGNAL: {state}  (score {last['FinalScore']:+.1f} = rule {last['Score']:+.0f} + ML {last['Conviction']:+.2f}, "
           f"P(up)={last['P_up']:.2f}, P(down)={last['P_down']:.2f})")
     if last["Reasons"]:
         print("Rule-engine reasons:")
         for r in last["Reasons"]:
             print("  -", r)
-
-    if plot:
-        plot_signals_chart(day_df, symbol)
-
-    return full, model
 
 
 full_history, ml_model = run_pipeline()
@@ -827,19 +1120,13 @@ def refresh_and_chart(model, symbol=SYMBOL, interval=INTERVAL, period=PERIOD,
     full = add_ml_predictions(full, model)
     full = combine_rule_and_ml(full, ml_weight)
     full = add_arrow_markers(full)
+    full = add_signal_outcomes(full)
 
-    today = full.index[-1].date()
-    day_df = full[full.index.date == today]
-    last = full.iloc[-1]
-    print(f"{symbol} | {full.index[-1]} | Last Close: {last['Close']:.2f}")
-    print(f"SIGNAL: {last['FinalSignal']}  (conviction {last['Conviction']:+.2f}, rule score {last['Score']}, "
-          f"P(up)={last['P_up']:.2f}, P(down)={last['P_down']:.2f})")
-    if last["Reasons"]:
-        print("Rule-engine reasons:")
-        for r in last["Reasons"]:
-            print("  -", r)
+    chart_df = last_n_trading_days(full, CHART_DAYS)
+    print_recent_signals(chart_df)
+    print_current_signal(full, symbol)
     if plot:
-        plot_signals_chart(day_df, symbol)
+        plot_signals_chart(chart_df, symbol)
     return full
 
 
