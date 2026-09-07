@@ -29,7 +29,7 @@ WARMUP_BARS = 60              # bars needed before the first signal can be compu
 FORWARD_HORIZON = 6           # bars ahead the model predicts (6 x 5min = 30 min)
 LABEL_THRESHOLD = 0.0006      # forward move must exceed this (0.06%) to count as up/down, else "flat"
 TRAIN_FRACTION = 0.7          # older 70% of history -> training, newer 30% -> honest out-of-sample test
-CONFIDENCE_THRESHOLD = 0.15   # min |P(up) - P(down)| required to fire a signal — raise for fewer/higher-conviction signals
+ML_WEIGHT = 1.0               # how much the ML model's opinion counts vs. the rule engine's
 RANDOM_STATE = 42
 N_FOLDS = 4                   # walk-forward validation folds
 
@@ -521,28 +521,31 @@ def add_ml_predictions(df, model, feature_cols=FEATURE_COLS):
     return df
 
 
-def combine_rule_and_ml(df, confidence_threshold=CONFIDENCE_THRESHOLD):
-    """Only fires a signal when the ML model shows real separation between its
-    up/down probabilities (>= confidence_threshold) AND the rule engine isn't
-    actively contradicting it. Raise confidence_threshold for fewer, higher-
-    conviction signals; lower it for more (noisier) ones — tune this against
-    your own walk-forward results, not a number given to you in advance."""
+def combine_rule_and_ml(df, ml_weight=ML_WEIGHT):
+    """Final score = rule-engine score, nudged by how strongly the ML model leans
+    up vs. down (scaled to roughly the same range as the rule score). This is
+    additive, not an all-or-nothing gate: a strong rule signal can still fire even
+    if the model is lukewarm, and vice versa — they reinforce or partially cancel
+    each other rather than one vetoing the other outright."""
     df = df.copy()
     conviction = df["P_up"].fillna(0) - df["P_down"].fillna(0)
-    rule_score = df["Score"].fillna(0)
     df["Conviction"] = conviction
-    df["FinalScore"] = conviction * 10
+    df["FinalScore"] = df["Score"].fillna(0) + ml_weight * conviction * 10
 
-    def classify(conv, score):
-        if pd.isna(conv):
+    def classify(s):
+        if pd.isna(s):
             return "HOLD"
-        if conv >= confidence_threshold and score >= 0:
-            return "STRONG BUY" if conv >= confidence_threshold * 2 else "BUY"
-        if conv <= -confidence_threshold and score <= 0:
-            return "STRONG SELL" if conv <= -confidence_threshold * 2 else "SELL"
+        if s >= 4:
+            return "STRONG BUY"
+        if s >= 2:
+            return "BUY"
+        if s <= -4:
+            return "STRONG SELL"
+        if s <= -2:
+            return "SELL"
         return "HOLD"
 
-    df["FinalSignal"] = [classify(c, s) for c, s in zip(conviction, rule_score)]
+    df["FinalSignal"] = df["FinalScore"].apply(classify)
     return df
 
 
@@ -616,7 +619,7 @@ def summarize_folds(fold_stats_list):
 
 
 def walk_forward_evaluate(df, feature_cols=FEATURE_COLS, n_folds=N_FOLDS, embargo=FORWARD_HORIZON,
-                           confidence_threshold=CONFIDENCE_THRESHOLD, random_state=RANDOM_STATE,
+                           ml_weight=ML_WEIGHT, random_state=RANDOM_STATE,
                            model_candidates=None):
     """Expanding-window walk-forward validation: fold k trains on everything
     before its test block (with an embargo) and tests on the next block, so every
@@ -645,7 +648,7 @@ def walk_forward_evaluate(df, feature_cols=FEATURE_COLS, n_folds=N_FOLDS, embarg
         for name, model_fn in model_candidates.items():
             model = train_ml_model(df, train_idx, model_fn, feature_cols, random_state)
             fold_df = add_ml_predictions(df, model, feature_cols)
-            fold_df = combine_rule_and_ml(fold_df, confidence_threshold)
+            fold_df = combine_rule_and_ml(fold_df, ml_weight)
             fold_df = add_arrow_markers(fold_df)
             trades = backtest_signals(fold_df, test_idx)
             stats = summarize_backtest(trades)
@@ -735,7 +738,7 @@ def plot_signals_chart(df, symbol=SYMBOL):
 
 
 def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, verbose=True,
-                  run_walk_forward=True, confidence_threshold=CONFIDENCE_THRESHOLD):
+                  run_walk_forward=True, ml_weight=ML_WEIGHT):
     raw = fetch_data(symbol, interval, period)
     raw = add_indicators(raw)
     full = compute_signal_history(raw)
@@ -746,7 +749,7 @@ def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, ver
         if verbose:
             print("=" * 64)
             print("Walk-forward validation across time-ordered folds (RandomForest vs HistGB)...")
-        wf = walk_forward_evaluate(full, confidence_threshold=confidence_threshold)
+        wf = walk_forward_evaluate(full, ml_weight=ml_weight)
         best_score = -1
         for name, folds in wf.items():
             agg = summarize_folds(folds)
@@ -766,7 +769,7 @@ def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, ver
     train_idx, test_idx = chronological_split(full, FEATURE_COLS)
     model = train_ml_model(full, train_idx, best_model_fn)
     full = add_ml_predictions(full, model)
-    full = combine_rule_and_ml(full, confidence_threshold)
+    full = combine_rule_and_ml(full, ml_weight)
     full = add_arrow_markers(full)
 
     if verbose:
@@ -785,7 +788,7 @@ def run_pipeline(symbol=SYMBOL, interval=INTERVAL, period=PERIOD, plot=True, ver
 
         trades = backtest_signals(full, test_idx)
         stats = summarize_backtest(trades)
-        print_backtest_report(trades, stats, label=f"Final holdout backtest ({best_name}, confidence>={confidence_threshold})")
+        print_backtest_report(trades, stats, label=f"Final holdout backtest ({best_name})")
         if plot:
             plot_equity_curve(stats, symbol)
 
@@ -814,7 +817,7 @@ import time
 from IPython.display import clear_output
 
 def refresh_and_chart(model, symbol=SYMBOL, interval=INTERVAL, period=PERIOD,
-                       confidence_threshold=CONFIDENCE_THRESHOLD, plot=True):
+                       ml_weight=ML_WEIGHT, plot=True):
     """Cheap refresh that reuses an already-trained model instead of retraining —
     use this for frequent intraday checks; it skips the walk-forward validation
     and backtest, which don't change meaningfully every 5 minutes anyway."""
@@ -822,7 +825,7 @@ def refresh_and_chart(model, symbol=SYMBOL, interval=INTERVAL, period=PERIOD,
     raw = add_indicators(raw)
     full = compute_signal_history(raw)
     full = add_ml_predictions(full, model)
-    full = combine_rule_and_ml(full, confidence_threshold)
+    full = combine_rule_and_ml(full, ml_weight)
     full = add_arrow_markers(full)
 
     today = full.index[-1].date()
