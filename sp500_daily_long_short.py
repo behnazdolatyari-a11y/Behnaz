@@ -247,7 +247,9 @@ def print_report(df, trades, status, live, symbol):
     bar = "=" * 72
     n_done = len(df) - (1 if live is not None else 0)
     last = df.iloc[n_done - 1]
-    trend = "UPTREND (LONG signals only)" if last.Close > last.ma200 else "DOWNTREND (SHORT signals only)"
+    trend = ("UPTREND (LONG signals only)" if last.Close > last.ma200 and last.ma50 > last.ma200 else
+             "DOWNTREND (SHORT signals only)" if last.Close < last.ma200 else
+             "NEUTRAL (above the 200-day avg, but the 50-day avg is still below it — no signals)")
     print(f"\n{bar}\n {symbol}  daily signals ({MODE} mode)   {now}\n{bar}")
     print(f"\n  Market: {trend} — close {last.Close:,.2f} vs 200-day avg {last.ma200:,.2f}")
     k = status["kind"]
@@ -268,10 +270,10 @@ def print_report(df, trades, status, live, symbol):
               f"or exit on a close {'above' if d == 1 else 'below'} {status['entry']:,.2f}")
     else:
         print("\n  >>> NO SIGNAL — stay flat.")
-        if last.Close > last.ma200:
+        if last.Close > last.ma200 and last.ma50 > last.ma200:
             print(f"      next LONG fires on a close with RSI(2) < {MODES[MODE]['long_rsi']} "
                   f"(now {last.rsi2:.0f}) or after 3 down days in a row")
-        else:
+        elif last.Close < last.ma200:
             print(f"      next SHORT fires on a {SHORT_HIGH_DAYS}-day closing high or RSI(2) > {SHORT_RSI} "
                   f"(now {last.rsi2:.0f})")
 
