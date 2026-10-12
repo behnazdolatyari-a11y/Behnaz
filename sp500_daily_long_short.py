@@ -13,8 +13,9 @@
 #   An opposite signal closes the open trade and reverses it.
 #
 #   SELF-CHECK (cuts wrong signals): before a signal is shown, the script looks up how that exact
-#   signal type did over the previous 3 years. Types that were not winning (win rate < 55% or
-#   profit factor < 1.1) are blocked. Only past results are used at every point — no hindsight.
+#   signal type did over the previous 3 years. Types that were losing (win rate < 50% or profit
+#   factor < 1.0) are blocked — but if every type is losing, the best one stays on, so you always
+#   get signals. Only past results are used at every point — no hindsight.
 #
 #   MODE sets how many signals you get (the track record shows how each mode did):
 #     "quality"  : RSI(2) < 10 / > 90 only            — a handful per month at most
@@ -64,8 +65,8 @@ ALLOW_SHORTS = True
 SELF_CHECK = True           # block signal types that were losing over the previous LOOKBACK days
 CHECK_LOOKBACK = 756        # ~3 years of trading days
 CHECK_MIN_TRADES = 15       # need at least this many past signals of the type to judge it
-CHECK_MIN_WIN = 0.55        # past win rate needed
-CHECK_MIN_PF = 1.1          # past profit factor needed
+CHECK_MIN_WIN = 0.50        # past win rate needed
+CHECK_MIN_PF = 1.0          # past profit factor needed (1.0 = broke even)
 COST_PCT = 0.0002           # commission + slippage per side
 
 CHART_DAYS = 126            # ~6 months on the chart
@@ -225,6 +226,17 @@ def _arrays(df):
     return tuple(df[k].to_numpy() for k in ("Open", "High", "Low", "Close", "ma_exit", "atr"))
 
 
+def _grade(exits, rets, i):
+    """(passes, profit factor) for a type's signals that finished in the lookback before bar i,
+    or None if there are too few to judge."""
+    past = rets[(exits >= i - CHECK_LOOKBACK) & (exits < i)]
+    if len(past) < CHECK_MIN_TRADES:
+        return None
+    loss = -past[past <= 0].sum()
+    pf = past[past > 0].sum() / loss if loss > 0 else np.inf
+    return ((past > 0).mean() >= CHECK_MIN_WIN and pf >= CHECK_MIN_PF), pf
+
+
 def self_check(df, complete):
     """For every signal day, look only at signals of the same type that had already FINISHED within
     the lookback window, and allow the new one only if that type was winning. Adds `allowed`."""
@@ -243,12 +255,16 @@ def self_check(df, complete):
         if not SELF_CHECK:
             allowed[i] = True
             continue
-        exits, rets = done.get(kind[i], (np.array([]), np.array([])))
-        past = rets[(exits >= i - CHECK_LOOKBACK) & (exits < i)]
-        if len(past) >= CHECK_MIN_TRADES:
-            loss = -past[past <= 0].sum()
-            pf = past[past > 0].sum() / loss if loss > 0 else np.inf
-            allowed[i] = (past > 0).mean() >= CHECK_MIN_WIN and pf >= CHECK_MIN_PF
+        grades = {k: _grade(ex, r, i) for k, (ex, r) in done.items()}
+        g = grades.get(kind[i])
+        if g is None:                                # not enough history yet: give it a chance
+            allowed[i] = True
+        elif g[0]:                                   # this type is winning
+            allowed[i] = True
+        elif not any(x and x[0] for x in grades.values()):
+            # every judged type is losing: keep only the best one (highest profit factor) on
+            best = max((k for k, x in grades.items() if x), key=lambda k: grades[k][1])
+            allowed[i] = kind[i] == best
     df = df.copy()
     df["allowed"] = allowed
     return df, done
@@ -257,18 +273,30 @@ def self_check(df, complete):
 def kind_report(df, done):
     """Each signal type's record over the last CHECK_LOOKBACK days and whether it is switched on now."""
     n = len(df)
+    grades = {k: _grade(ex, r, n) for k, (ex, r) in done.items()}
+    any_pass = any(g and g[0] for g in grades.values())
+    judged = [k for k, g in grades.items() if g]
+    best = max(judged, key=lambda k: grades[k][1]) if judged else None
     lines = []
     for k in sorted({k for k in df["kind"] if k}):
         exits, rets = done.get(k, (np.array([]), np.array([])))
-        past = rets[exits >= n - 1 - CHECK_LOOKBACK]
+        past = rets[(exits >= n - CHECK_LOOKBACK) & (exits < n)]
+        g = grades.get(k)
+        if g is None:
+            state = "ON (not enough history to judge)"
+        elif g[0]:
+            state = "ON"
+        elif not any_pass and k == best:
+            state = "ON (best of a weak bunch)"
+        else:
+            state = "blocked (was losing)"
         if len(past) == 0:
-            lines.append(f"    {k:<13} no finished signals yet")
+            lines.append(f"    {k:<13} no finished signals yet   -> {state}")
             continue
         loss = -past[past <= 0].sum()
         pf = past[past > 0].sum() / loss if loss > 0 else np.inf
-        on = (len(past) >= CHECK_MIN_TRADES and (past > 0).mean() >= CHECK_MIN_WIN and pf >= CHECK_MIN_PF)
         lines.append(f"    {k:<13} {len(past):4d} signals   win {100 * (past > 0).mean():5.1f}%   "
-                     f"profit factor {pf:4.2f}   -> {'ON' if on or not SELF_CHECK else 'blocked'}")
+                     f"profit factor {pf:4.2f}   -> {state if SELF_CHECK else 'ON'}")
     return lines
 
 
