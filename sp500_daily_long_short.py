@@ -74,22 +74,67 @@ LONG_COLOR, SHORT_COLOR, FLAT_COLOR = "#0f8a5f", "#d95f02", "#9aa0a6"
 
 # ---------------------------------------------------------------- data
 def _flatten(df):
+    if df is None:
+        return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [c.capitalize() for c in df.columns]
     return df
 
 
+def _clean(df):
+    df = _flatten(df)
+    if df is None or df.empty or not {"Open", "High", "Low", "Close"} <= set(df.columns):
+        return pd.DataFrame()
+    df = df[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna().sort_index()
+    idx = pd.to_datetime(df.index)
+    df.index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
+    return df[~df.index.duplicated(keep="last")]
+
+
+def _from_yahoo(symbol, start, tries=3):
+    import yfinance as yf
+    for k in range(tries):
+        try:
+            df = _clean(yf.download(symbol, start=start, interval="1d", auto_adjust=True,
+                                    progress=False, threads=False))
+            if not df.empty:
+                return df
+        except Exception as e:                       # rate limit, network, Yahoo format change...
+            print(f"  Yahoo attempt {k + 1} failed: {type(e).__name__}: {e}")
+        time.sleep(2 * (k + 1))
+    return pd.DataFrame()
+
+
+def _stooq_symbol(symbol):
+    return {"^GSPC": "^spx", "^SPX": "^spx", "ES=F": "es.f"}.get(symbol.upper(), symbol.lower() + ".us")
+
+
+def _from_stooq(symbol, start):
+    url = f"https://stooq.com/q/d/l/?s={_stooq_symbol(symbol)}&i=d"
+    try:
+        df = _clean(pd.read_csv(url, parse_dates=["Date"], index_col="Date"))
+        return df[df.index >= pd.Timestamp(start)]
+    except Exception as e:
+        print(f"  Stooq failed: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+
 def fetch_daily(symbol=SYMBOL, start=START, csv_path=CSV_PATH):
+    """Daily candles: your CSV if given, else Yahoo Finance, else Stooq as a backup."""
     if csv_path:
-        df = _flatten(pd.read_csv(csv_path, parse_dates=[0], index_col=0))
+        df = _clean(pd.read_csv(csv_path, parse_dates=[0], index_col=0))
     else:
-        import yfinance as yf
-        df = _flatten(yf.download(symbol, start=start, interval="1d", auto_adjust=True, progress=False))
-    df = df[["Open", "High", "Low", "Close"]].dropna().sort_index()
-    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-    if df.empty:
-        raise RuntimeError(f"No daily data for {symbol}")
+        df = _from_yahoo(symbol, start)
+        if df.empty:
+            print("  Yahoo Finance returned no data — trying the Stooq backup…")
+            df = _from_stooq(symbol, start)
+    if len(df) < 250:
+        raise RuntimeError(
+            f"Could not download enough daily data for {symbol} ({len(df)} rows).\n"
+            "  Fixes: 1) run  !pip install -U yfinance  and restart the runtime,\n"
+            "         2) wait a few minutes (Yahoo rate-limits Colab) and run again,\n"
+            "         3) or download a daily CSV (Date,Open,High,Low,Close) and set CSV_PATH.")
     return df
 
 
@@ -97,9 +142,14 @@ def fetch_intraday(symbol=SYMBOL):
     """Today's 5-minute bars (regular session). Empty DataFrame if unavailable."""
     try:
         import yfinance as yf
-        intr = _flatten(yf.download(symbol, period="1d", interval="5m", auto_adjust=True, progress=False))
-    except Exception:
+        intr = _flatten(yf.download(symbol, period="1d", interval="5m", auto_adjust=True,
+                                    progress=False, threads=False))
+    except Exception as e:
+        print(f"  Live 5-minute data unavailable ({type(e).__name__}) — using daily data only.")
         return pd.DataFrame()
+    if intr is None or intr.empty or not {"Open", "High", "Low", "Close"} <= set(intr.columns):
+        return pd.DataFrame()
+    intr = intr.dropna(subset=["Open", "High", "Low", "Close"])
     if intr.empty:
         return intr
     intr.index = (intr.index.tz_convert(NY) if intr.index.tz is not None
