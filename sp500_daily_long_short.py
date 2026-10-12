@@ -23,6 +23,11 @@
 #   Shorts only appear when the S&P is below its 200-day average — in a bull market that is
 #   rare, because shorting a rising market loses more often than it wins.
 #
+#   Why some arrows LOOK wrong: these signals buy a drop (or short a rally) while it is happening.
+#   On real SPY ~40% of signals moved further against the arrow for a day or two — yet only ~25%
+#   ended as a loss. Waiting for price to turn first was tested and made results much worse.
+#   The chart marks every finished signal: ✓ = made money, ✗ = lost money.
+#
 #   python sp500_daily_long_short.py              # today's status + chart (run it every day)
 #   python sp500_daily_long_short.py --live       # re-check every 15 min during market hours
 #   python sp500_daily_long_short.py --mode more  # more signals, slightly lower quality
@@ -287,6 +292,13 @@ def print_report(df, trades, status, live, symbol):
           f"(enter next open, costs included) — about {len(trades) / months:.1f} signals per month:")
     for line in summary(trades):
         print(line)
+    done = trades[trades["reason"] != "open"].tail(10) if not trades.empty else trades
+    if not done.empty:
+        won = int((done["ret"] > 0).sum())
+        print(f"\n  Last {len(done)} signals: {won} made money, {len(done) - won} lost")
+        for _, t in done.iterrows():
+            print(f"    {t.signal_date.date()}  {side[t.dir]:<5} {t.type:<21} {t.ret:+6.2f}%  "
+                  f"{'✓' if t.ret > 0 else '✗'}  ({t.reason}, {t.days}d)")
     print(bar)
 
 
@@ -313,10 +325,11 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
     if not trades.empty:
         for _, t in trades[trades["signal_date"] >= v.index[0]].iterrows():
             res = "still open" if t.reason == "open" else f"exit {t.exit:,.2f} on {t.exit_date.date()} ({t.reason})"
-            pts.append((t.signal_date, t.dir, "",
+            mark = "…" if t.reason == "open" else ("✓" if t.ret > 0 else "✗")
+            pts.append((t.signal_date, t.dir, mark,
                         f"{t.type}<br>entry {t.entry:,.2f} on {t.entry_date.date()}<br>{res}<br>result {t.ret:+.2f}%"))
     if status["kind"] == "new":
-        pts.append((status["date"], status["dir"], " (new)", f"{status['type']}<br>enter at the next open"))
+        pts.append((status["date"], status["dir"], "NEW", f"{status['type']}<br>enter at the next open"))
     if live is not None and df["setup"].iat[-1] != 0 and status["kind"] != "open":
         pts.append((df.index[-1], int(df["setup"].iat[-1]), "?", "forming — confirms at the close"))
 
@@ -328,15 +341,16 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
         y = [v.at[t, "Low"] - 0.6 * v.at[t, "atr"] if d == 1 else v.at[t, "High"] + 0.6 * v.at[t, "atr"] for t in x]
         fig.add_trace(go.Scatter(
             x=x, y=y, mode="markers+text", name=name,
-            text=[name + q[2] if q[2] else "" for q in p],          # label only the new / forming one
+            text=[q[2] for q in p],                                   # ✓ won, ✗ lost, NEW / ? pending
             textposition="bottom center" if d == 1 else "top center",
-            textfont=dict(size=12, color=color),
+            textfont=dict(size=12, color="#3c4043"),
             marker=dict(symbol=sym, size=13, color=color, line=dict(width=1, color="white")),
             hovertemplate=[f"<b>{name}</b> signal {q[0].date()}<br>{q[3]}<extra></extra>" for q in p]))
 
     missing = pd.bdate_range(v.index[0], v.index[-1]).difference(v.index)
     fig.update_layout(
-        title=dict(text=f"<b>{symbol}</b> daily — LONG / SHORT signals", x=0.01),
+        title=dict(text=f"<b>{symbol}</b> daily — LONG / SHORT signals   "
+                        f"<span style='font-size:12px;color:#5f6368'>✓ made money · ✗ lost money</span>", x=0.01),
         template="plotly_white", height=650, hovermode="closest",
         legend=dict(orientation="h", x=1, xanchor="right", y=1.06, font=dict(size=13)),
         xaxis_rangeslider_visible=False, margin=dict(l=60, r=30, t=60, b=40),
