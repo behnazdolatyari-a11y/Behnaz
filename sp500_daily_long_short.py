@@ -3,23 +3,29 @@
 #
 # S&P 500 DAILY LONG / SHORT SIGNALS
 # ----------------------------------
-# Few, high-quality signals: buy sharp pullbacks in a strong uptrend, short sharp bounces in a
-# strong downtrend.
+# Buy weakness in an uptrend, short strength in a downtrend.
 #
-#   LONG   uptrend   : close > 200-day avg, 50-day avg > 200-day avg, 200-day avg rising
-#          pullback  : RSI(2) < 10  (2-3 sharp down days)
-#   SHORT  downtrend : bear market  (close < 200-day avg, 50-day avg < 200-day avg, 200-day falling)
-#                      or correction (close < 50-day avg and the 50-day avg falling)
-#          bounce    : RSI(2) > 90  (2-3 sharp up days)
+#   Trend  UP   : close > 200-day avg and the 50-day avg is not falling below price
+#          DOWN : bear market  (close < 200-day avg, 50-day avg < 200-day avg)
+#                 or correction (close < 50-day avg and the 50-day avg falling)
+#   LONG   in an UP trend, after a pullback:  RSI(2) low   OR  closed near the day's low (IBS)
+#   SHORT  in a DOWN trend, after a bounce:   RSI(2) high  OR  closed near the day's high (IBS)
+#
+#   MODE sets how many signals you get (the track record shows how each mode did):
+#     "quality"  : RSI(2) < 10 / > 90 only            — a handful per month at most
+#     "balanced" : RSI(2) < 20 / > 80, IBS < .2 / > .8 — about weekly
+#     "active"   : RSI(2) < 35 / > 65, IBS < .35 / > .65 — about weekly, 1-5 day swings
+#     "daily"    : RSI(2) < 40 / > 60, IBS < .5 / > .5  — most days; in at the open, out at the close
 #
 #   Entry : next day's open (the signal is confirmed at the close).
-#   Exit  : first close back above the 5-day average (LONG) / below it (SHORT),
-#           or the stop (2.5 x ATR), or after 10 days — whichever comes first.
+#   Exit  : first close above the previous day's high or the 5-day average (LONG; mirror for SHORT),
+#           or the stop (2 x ATR), or after the mode's max days — whichever comes first.
 #   Only one trade at a time, so the chart shows one arrow per trade.
 #
 #   python sp500_daily_long_short.py              # today's status + chart
 #   python sp500_daily_long_short.py --live       # re-check every 15 min during market hours
 #   python sp500_daily_long_short.py --long-only  # no SHORT signals
+#   python sp500_daily_long_short.py --mode balanced
 #   python sp500_daily_long_short.py --symbol SPY
 #
 # The chart opens by itself: under the cell in Colab/Jupyter, in your browser from a terminal.
@@ -39,15 +45,19 @@ SYMBOL = "^GSPC"            # S&P 500 index. "SPY" = ETF, "ES=F" = futures
 START = "2000-01-01"
 CSV_PATH = None             # optional: daily CSV (Date,Open,High,Low,Close) instead of downloading
 
-LONG_RSI = 10               # LONG when RSI(2) drops below this in an uptrend
-SHORT_RSI = 90              # SHORT when RSI(2) rises above this in a downtrend
-EXIT_MA = 5                 # exit on a close back across the 5-day average
-STOP_ATR = 2.5              # protective stop distance in daily ATRs
-MAX_DAYS = 10               # time exit
+MODE = "daily"              # "quality" (fewest, strongest) · "balanced" · "active" · "daily" (most days)
+MODES = {   # RSI(2) long/short, IBS long/short (None = off), max holding days
+    "quality":  dict(rsi=(10, 90), ibs=None,       max_days=10),
+    "balanced": dict(rsi=(20, 80), ibs=(0.2, 0.8), max_days=5),
+    "active":   dict(rsi=(35, 65), ibs=(0.35, 0.65), max_days=5),
+    "daily":    dict(rsi=(40, 60), ibs=(0.5, 0.5),   max_days=1),   # day trade: out at the same day's close
+}
+EXIT_MA = 5                 # exit on a close back across the 5-day average (or past yesterday's high/low)
+STOP_ATR = 2.0              # protective stop distance in daily ATRs
 ALLOW_SHORTS = True
 COST_PCT = 0.0002           # commission + slippage per side
 
-CHART_DAYS = 252            # ~1 year on the chart
+CHART_DAYS = 126            # ~6 months on the chart
 HTML_PATH = "sp500_signals.html"
 LIVE_EVERY_MIN = 15
 NY = "America/New_York"
@@ -149,14 +159,23 @@ def add_indicators(df):
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
-    rising = df["ma200"] > df["ma200"].shift(20)
-    uptrend = (c > df["ma200"]) & (df["ma50"] > df["ma200"]) & rising
-    bear = (c < df["ma200"]) & (df["ma50"] < df["ma200"]) & ~rising
+    rng = (h - l).replace(0, np.nan)
+    df["ibs"] = ((c - l) / rng).fillna(0.5)          # 0 = closed at the day's low, 1 = at the high
+
+    bear = (c < df["ma200"]) & (df["ma50"] < df["ma200"])
     correction = (c < df["ma50"]) & (df["ma50"] < df["ma50"].shift(10))   # pullback inside a bull market
     downtrend = bear | correction
-    df["setup"] = np.select([uptrend & (df["rsi2"] < LONG_RSI),
-                             downtrend & (df["rsi2"] > SHORT_RSI) & ALLOW_SHORTS], [1, -1], 0)
-    df.loc[df["ma200"].shift(20).isna(), "setup"] = 0
+    uptrend = (c > df["ma200"]) & ~correction
+
+    m = MODES[MODE]
+    lo_rsi, hi_rsi = m["rsi"]
+    weak, strong = df["rsi2"] < lo_rsi, df["rsi2"] > hi_rsi
+    if m["ibs"]:
+        lo_ibs, hi_ibs = m["ibs"]
+        weak |= (df["ibs"] < lo_ibs) & (c < c.shift())
+        strong |= (df["ibs"] > hi_ibs) & (c > c.shift())
+    df["setup"] = np.select([uptrend & weak, downtrend & strong & ALLOW_SHORTS], [1, -1], 0)
+    df.loc[df["ma200"].isna(), "setup"] = 0
     return df
 
 
@@ -165,6 +184,7 @@ def simulate(df, complete):
     Returns (trades, status) where status says what to do now: new / open / flat."""
     o, h, l, c = (df[k].to_numpy() for k in ("Open", "High", "Low", "Close"))
     ma, atr, setup = df["ma_exit"].to_numpy(), df["atr"].to_numpy(), df["setup"].to_numpy()
+    max_days = MODES[MODE]["max_days"]
     trades, i, status = [], 0, None
     while i < complete:
         if setup[i] == 0:
@@ -181,9 +201,9 @@ def simulate(df, complete):
         for j in range(e, complete):
             if (d == 1 and l[j] <= stop) or (d == -1 and h[j] >= stop):
                 exit_i, exit_px, reason = j, (min(o[j], stop) if d == 1 else max(o[j], stop)), "stop"
-            elif (d == 1 and c[j] > ma[j]) or (d == -1 and c[j] < ma[j]):
+            elif (d == 1 and (c[j] > ma[j] or c[j] > h[j - 1])) or (d == -1 and (c[j] < ma[j] or c[j] < l[j - 1])):
                 exit_i, exit_px, reason = j, c[j], "target"
-            elif j - e + 1 >= MAX_DAYS:
+            elif j - e + 1 >= max_days:
                 exit_i, exit_px, reason = j, c[j], "time"
             if exit_i is not None:
                 break
@@ -197,7 +217,7 @@ def simulate(df, complete):
         t.update(exit_date=df.index[exit_i], exit=exit_px, reason=reason, days=exit_i - e + 1,
                  ret=100 * (d * (exit_px - entry) / entry - 2 * COST_PCT))
         trades.append(t)
-        i = exit_i + 1
+        i = exit_i                                  # a new signal can fire on the exit day's close
     return pd.DataFrame(trades), status or {"kind": "flat"}
 
 
@@ -220,20 +240,27 @@ def print_report(df, trades, status, live, symbol):
     side = {1: "LONG", -1: "SHORT"}
     now = pd.Timestamp.now(tz=NY).strftime("%Y-%m-%d %H:%M ET")
     bar = "=" * 72
-    print(f"\n{bar}\n {symbol}  daily signals   {now}\n{bar}")
+    print(f"\n{bar}\n {symbol}  daily signals ({MODE} mode)   {now}\n{bar}")
     k = status["kind"]
     if k == "new":
         d = status["dir"]
+        when = "today's open" if live is not None else "the next open"
         print(f"\n  >>> NEW {side[d]} SIGNAL (close of {status['date'].date()}) — "
-              f"{'buy' if d == 1 else 'sell short'} at the next open (~{status['close']:,.2f})")
-        print(f"      stop ~{status['stop']:,.2f}   exit on the first close {'above' if d == 1 else 'below'} "
-              f"the {EXIT_MA}-day average, max {MAX_DAYS} days")
+              f"{'buy' if d == 1 else 'sell short'} at {when} (~{status['close']:,.2f})")
+        if MODES[MODE]["max_days"] == 1:
+            print(f"      stop ~{status['stop']:,.2f}   exit at the same day's close (day trade)")
+        else:
+            print(f"      stop ~{status['stop']:,.2f}   exit on the first close {'above' if d == 1 else 'below'} "
+                  f"the day before's {'high' if d == 1 else 'low'} or the {EXIT_MA}-day average, "
+                  f"max {MODES[MODE]['max_days']} days")
     elif k == "open":
         d = status["dir"]
         print(f"\n  >>> IN {side[d]} since {status['entry_date'].date()} @ {status['entry']:,.2f}   "
-              f"P/L {status['ret']:+.2f}%   day {status['days']} of {MAX_DAYS}")
+              f"P/L {status['ret']:+.2f}%   day {status['days']} of {MODES[MODE]['max_days']}")
+        prev = df["High"].iat[-2] if d == 1 else df["Low"].iat[-2]
+        lvl = min(status["ma"], prev) if d == 1 else max(status["ma"], prev)
         print(f"      stop {status['stop']:,.2f}   exit on a close {'above' if d == 1 else 'below'} "
-              f"{status['ma']:,.2f} ({EXIT_MA}-day average)")
+              f"{lvl:,.2f}")
     else:
         print("\n  >>> NO SIGNAL — stay flat.")
 
@@ -244,7 +271,8 @@ def print_report(df, trades, status, live, symbol):
             d = status["dir"]
             if (r.Low <= status["stop"]) if d == 1 else (r.High >= status["stop"]):
                 print("      stop hit today — the trade is closed.")
-            elif (r.Close > r.ma_exit) if d == 1 else (r.Close < r.ma_exit):
+            elif ((r.Close > r.ma_exit or r.Close > df["High"].iat[-2]) if d == 1
+                  else (r.Close < r.ma_exit or r.Close < df["Low"].iat[-2])):
                 print("      exit condition met — plan to close at today's close.")
             else:
                 print("      hold — exit condition not met yet.")
@@ -253,7 +281,9 @@ def print_report(df, trades, status, live, symbol):
         else:
             print("      no signal forming.")
 
-    print(f"\n  Track record {df.index[0].date()} -> {df.index[-1].date()} (enter next open, costs included):")
+    months = max((df.index[-1] - df.index[0]).days / 30.4, 1)
+    print(f"\n  Track record, mode '{MODE}', {df.index[0].date()} -> {df.index[-1].date()} "
+          f"(enter next open, costs included) — about {len(trades) / months:.1f} signals per month:")
     for line in summary(trades):
         print(line)
     print(bar)
@@ -273,7 +303,7 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
 
     v = df.iloc[-CHART_DAYS:]
     fig = go.Figure(go.Candlestick(
-        x=v.index, open=v.Open, high=v.High, low=v.Low, close=v.Close, name=symbol,
+        x=v.index, open=v.Open, high=v.High, low=v.Low, close=v.Close, name=symbol, showlegend=False,
         increasing=dict(line=dict(color="#9aa0a6", width=1), fillcolor="#ffffff"),
         decreasing=dict(line=dict(color="#5f6368", width=1), fillcolor="#5f6368")))
 
@@ -296,16 +326,18 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
         x = [q[0] for q in p]
         y = [v.at[t, "Low"] - 0.6 * v.at[t, "atr"] if d == 1 else v.at[t, "High"] + 0.6 * v.at[t, "atr"] for t in x]
         fig.add_trace(go.Scatter(
-            x=x, y=y, mode="markers+text", name=name, text=[name + q[2] for q in p],
+            x=x, y=y, mode="markers+text", name=name,
+            text=[name + q[2] if q[2] else "" for q in p],          # label only the new / forming one
             textposition="bottom center" if d == 1 else "top center",
-            textfont=dict(size=11, color=color),
-            marker=dict(symbol=sym, size=15, color=color, line=dict(width=1, color="white")),
+            textfont=dict(size=12, color=color),
+            marker=dict(symbol=sym, size=12, color=color, line=dict(width=1, color="white")),
             hovertemplate=[f"<b>{name}</b> signal {q[0].date()}<br>{q[3]}<extra></extra>" for q in p]))
 
     missing = pd.bdate_range(v.index[0], v.index[-1]).difference(v.index)
     fig.update_layout(
         title=dict(text=f"<b>{symbol}</b> daily — LONG / SHORT signals", x=0.01),
-        template="plotly_white", height=650, showlegend=False, hovermode="closest",
+        template="plotly_white", height=650, hovermode="closest",
+        legend=dict(orientation="h", x=1, xanchor="right", y=1.06, font=dict(size=13)),
         xaxis_rangeslider_visible=False, margin=dict(l=60, r=30, t=60, b=40),
         font=dict(family="Inter, Segoe UI, Arial", size=12, color="#3c4043"))
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(values=list(missing))], showgrid=False)
@@ -362,11 +394,13 @@ if __name__ == "__main__":
     ap.add_argument("--live", action="store_true", help="re-check every --every minutes in market hours")
     ap.add_argument("--every", type=int, default=LIVE_EVERY_MIN)
     ap.add_argument("--long-only", action="store_true")
+    ap.add_argument("--mode", default=MODE, choices=list(MODES))
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--no-open", action="store_true", help="save the chart but don't open/show it")
     args, _ = ap.parse_known_args()       # parse_known_args so it also runs inside Colab/Jupyter
     if args.long_only:
         ALLOW_SHORTS = False
+    MODE = args.mode
     kw = dict(start=args.start, csv_path=args.csv, plot=not args.no_plot, show=not args.no_open)
     if args.live:
         run_live(args.symbol, args.every, **kw)
