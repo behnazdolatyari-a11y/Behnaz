@@ -4,7 +4,15 @@
 # S&P 500 DAILY BIAS — "should I be LONG or SHORT today?"
 # --------------------------------------------------------
 # Every day the script scores the S&P 500 daily chart from -9 (strong short) to +9 (strong long)
-# and turns that into one call: LONG, SHORT or STAY OUT.
+# and turns that into one call: LONG, SHORT or STAY OUT (the background shading on the chart).
+#
+# On top of the call it marks ENTRY SIGNALS on the chart — only in the direction of the call:
+#   BUY  Trend     the call just turned LONG          SELL Trend     the call just turned SHORT
+#   BUY  Breakout  close above the 20-day high        SELL Breakdown close below the 20-day low
+#   BUY  Bounce    dipped to EMA20, closed back above SELL Reject    rallied to EMA20, closed back below
+#   BUY  Dip       RSI(2) < 10 (sharp pullback)       SELL Rally     RSI(2) > 90 (sharp bounce)
+# Each signal: enter next open, stop 1.5 x ATR, target 2 x ATR, exit after 10 days at the latest.
+# The chart marks every signal with ✓ (hit target / closed up) or ✗ (stopped / closed down).
 #
 #   python sp500_daily_long_short.py                 # today's call + chart (sp500_daily_bias.html)
 #   python sp500_daily_long_short.py --symbol SPY    # trade the ETF instead of the index
@@ -49,6 +57,11 @@ INTRADAY_STOP_ATR = 0.5     # intraday stop  = entry -/+ 0.5 x daily ATR
 INTRADAY_T1_ATR = 0.5       # first target   = entry +/- 0.5 x ATR
 INTRADAY_T2_ATR = 1.0       # second target  = entry +/- 1.0 x ATR
 COST_PCT = 0.0002           # commission + slippage per side (0.02%, SPY/ES-like)
+
+SETUP_STOP_ATR = 1.5        # entry-signal stop   = entry -/+ 1.5 x ATR
+SETUP_TARGET_ATR = 2.0      # entry-signal target = entry +/- 2.0 x ATR
+SETUP_MAX_DAYS = 10         # entry-signal time exit
+SETUP_COOLDOWN = 3          # min days between two signals in the same direction (less clutter)
 
 CHART_DAYS = 126            # trading days on the chart (~6 months)
 HTML_PATH = "sp500_daily_bias.html"
@@ -190,6 +203,81 @@ def strength(score):
     return "strong" if a >= 6 else "moderate" if a >= 4 else "weak" if a >= 3 else "no edge"
 
 
+# ---------------------------------------------------------------- entry signals
+def add_setups(df):
+    """Entry signals at the close of day i, only in the direction of that day's call."""
+    df = df.copy()
+    o, h, l, c, bias = df["Open"], df["High"], df["Low"], df["Close"], df["bias"]
+    hi20, lo20 = h.shift().rolling(20).max(), l.shift().rolling(20).min()
+    long_setups = [("Trend", (bias == 1) & (bias.shift() != 1)),
+                   ("Breakout", c > hi20),
+                   ("Bounce", (l <= df["ema20"]) & (c > df["ema20"]) & (c > o)),
+                   ("Dip", df["rsi2"] < 10)]
+    short_setups = [("Trend", (bias == -1) & (bias.shift() != -1)),
+                    ("Breakdown", c < lo20),
+                    ("Reject", (h >= df["ema20"]) & (c < df["ema20"]) & (c < o)),
+                    ("Rally", df["rsi2"] > 90)]
+    sig, name = np.zeros(len(df), dtype=int), np.full(len(df), "", dtype=object)
+    last_i, last_d = -999, 0
+    b = bias.to_numpy()
+    for i in range(200, len(df)):
+        setups = long_setups if b[i] == 1 else short_setups if b[i] == -1 else []
+        hit = next((nm for nm, cond in setups if cond.iloc[i]), None)
+        if hit and (b[i] != last_d or i - last_i >= SETUP_COOLDOWN):
+            sig[i], name[i], last_i, last_d = b[i], hit, i, b[i]
+    df["setup"], df["setup_name"] = sig, name
+    return df
+
+
+def evaluate_setups(df, provisional):
+    """Play out every signal: enter next open, ATR stop/target, time exit. Returns one row per signal."""
+    o, h, l, c, atr = (df[k].to_numpy() for k in ("Open", "High", "Low", "Close", "atr"))
+    n = len(df) - 1 if provisional else len(df)          # last bar we can trade on
+    rows = []
+    for i in np.flatnonzero(df["setup"].to_numpy() != 0):
+        d = int(df["setup"].iat[i])
+        r = {"date": df.index[i], "side": "BUY" if d == 1 else "SELL", "dir": d,
+             "setup": df["setup_name"].iat[i], "score": int(df["score"].iat[i]),
+             "signal_close": c[i], "atr": atr[i]}
+        if i >= n - 1:                                     # fired at the last close (or is forming now)
+            r["status"] = "Forming" if (provisional and i == len(df) - 1) else "Enter next open"
+            rows.append(r)
+            continue
+        entry = o[i + 1]
+        stop, target = entry - d * SETUP_STOP_ATR * atr[i], entry + d * SETUP_TARGET_ATR * atr[i]
+        ex = None
+        for j in range(i + 1, min(i + 1 + SETUP_MAX_DAYS, n)):
+            if (d == 1 and l[j] <= stop) or (d == -1 and h[j] >= stop):
+                ex = (j, min(o[j], stop) if d == 1 else max(o[j], stop), "Stop")
+            elif (d == 1 and h[j] >= target) or (d == -1 and l[j] <= target):
+                ex = (j, max(o[j], target) if d == 1 else min(o[j], target), "Target")
+            if ex:
+                break
+        if ex is None:
+            j = i + SETUP_MAX_DAYS
+            ex = (j, c[j], "Time") if j <= n - 1 else (n - 1, c[n - 1], "Open")
+        j, px, why = ex
+        r.update(entry_date=df.index[i + 1], entry=entry, stop=stop, target=target,
+                 exit_date=df.index[j], exit=px, status=why,
+                 return_pct=100 * (d * (px - entry) / entry - (2 * COST_PCT if why != "Open" else 0)))
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def setup_stats(sig):
+    done = sig[sig["status"].isin(["Target", "Stop", "Time"])] if not sig.empty else sig
+    if done.empty:
+        return pd.DataFrame()
+    def agg(g):
+        r = g["return_pct"]
+        loss = -r[r <= 0].sum()
+        return pd.Series({"signals": len(r), "win %": 100 * (r > 0).mean(), "avg %": r.mean(),
+                          "profit factor": r[r > 0].sum() / loss if loss > 0 else np.inf})
+    table = done.groupby(["side", "setup"]).apply(agg)
+    table.loc[("ALL", ""), :] = agg(done)
+    return table.round(2)
+
+
 # ---------------------------------------------------------------- backtest
 def backtest(df):
     """Follow the call: bias at close t is held on day t+1.
@@ -293,6 +381,7 @@ def print_report(df, intr, provisional, symbol=SYMBOL):
     else:
         print("\n  No edge today: stay out, or trade only a clean break of yesterday's high/low.")
     print("  Levels: " + "   ".join(f"{k} {v:,.2f}" for k, v in p["levels"].items()))
+    print_signal_status(df, provisional)
 
     if provisional and not intr.empty:
         live = df.iloc[-1]
@@ -319,6 +408,43 @@ def print_report(df, intr, provisional, symbol=SYMBOL):
     print(bar)
 
 
+def print_signal_status(df, provisional):
+    sig = evaluate_setups(df, provisional)
+    print("\n  ENTRY SIGNALS:")
+    if sig.empty:
+        print("    none yet")
+        return
+    new = sig[sig["status"] == "Enter next open"]
+    for _, r in new.iterrows():
+        a = r.atr
+        print(f"    >>> NEW SIGNAL at {r.date.date()} close: {r.side} {r.setup} — enter at the next open "
+              f"(~{r.signal_close:,.2f}), stop ~{r.signal_close - r.dir * SETUP_STOP_ATR * a:,.2f}, "
+              f"target ~{r.signal_close + r.dir * SETUP_TARGET_ATR * a:,.2f}")
+    for _, r in sig[sig["status"] == "Open"].iterrows():
+        print(f"    Active: {r.side} {r.setup} since {r.entry_date.date()} @ {r.entry:,.2f}   "
+              f"stop {r.stop:,.2f}   target {r.target:,.2f}   now {r.return_pct:+.2f}%")
+    for _, r in sig[sig["status"] == "Forming"].iterrows():
+        print(f"    Forming today: {r.side} {r.setup} — only valid if it still holds at the close.")
+    if new.empty and not (sig["status"] == "Open").any():
+        print(f"    No new signal at the last close. Last one: {sig.iloc[-1].side} {sig.iloc[-1].setup} "
+              f"on {sig.iloc[-1].date.date()}.")
+
+
+def print_signal_history(df, provisional, last_n=10):
+    sig = evaluate_setups(df, provisional)
+    stats = setup_stats(sig)
+    if stats.empty:
+        return
+    print("\nENTRY SIGNAL RESULTS (each signal traded on its own: next open, ATR stop/target, 10-day max)")
+    print(stats.to_string())
+    done = sig[sig["status"].isin(["Target", "Stop", "Time", "Open"])].tail(last_n)
+    print(f"\nLast {len(done)} signals:")
+    for _, r in done.iterrows():
+        mark = "✓" if r.return_pct > 0 else "✗"
+        print(f"  {r.date.date()}  {r.side:<4} {r.setup:<9}  entry {r.entry:>10,.2f}  exit {r.exit:>10,.2f} "
+              f"{r.status:<6}  {r.return_pct:+6.2f}%  {mark if r.status != 'Open' else '(open)'}")
+
+
 # ---------------------------------------------------------------- chart
 def in_notebook():
     """True inside Colab / Jupyter, where the chart can be drawn right under the cell."""
@@ -340,7 +466,7 @@ def plot_chart(df, provisional, symbol=SYMBOL, days=CHART_DAYS, html_path=HTML_P
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
                         row_heights=[0.62, 0.18, 0.20],
-                        subplot_titles=("Price — shaded by the call for that day",
+                        subplot_titles=("Price — shaded by the daily call · ▲▼ entry signals (✓ win, ✗ loss)",
                                         f"Daily score (LONG ≥ {LONG_THRESHOLD}, SHORT ≤ {SHORT_THRESHOLD})",
                                         "Growth of $1 following the calls"))
 
@@ -366,29 +492,56 @@ def plot_chart(df, provisional, symbol=SYMBOL, days=CHART_DAYS, html_path=HTML_P
         fig.add_trace(go.Scatter(x=v.index, y=v[col], name=name, mode="lines",
                                  line=dict(color=color, width=1.5, dash=dash), hoverinfo="skip"), row=1, col=1)
 
-    # arrows where the call changes (signal fires at that close -> act next day)
-    flips = v[(v["bias"] != v["bias"].shift()) & (v.index != v.index[0])]
-    pad = v["atr"] * 0.6
-    for b, sym, txt, color, y, pos in ((1, "triangle-up", "LONG", LONG_COLOR, flips.Low - pad, "bottom center"),
-                                       (-1, "triangle-down", "SHORT", SHORT_COLOR, flips.High + pad, "top center"),
-                                       (0, "circle", "OUT", FLAT_COLOR, flips.High + pad, "top center")):
-        f = flips[flips["bias"] == b]
-        if f.empty:
+    # entry signals: arrow + label on the signal day, dotted path from entry to exit
+    sig = evaluate_setups(df, provisional)
+    sig = sig[sig["date"] >= v.index[0]] if not sig.empty else sig
+    pad = v["atr"] * 0.7
+    for d, sym, side, color in ((1, "triangle-up", "BUY", LONG_COLOR), (-1, "triangle-down", "SELL", SHORT_COLOR)):
+        g = sig[sig["dir"] == d] if not sig.empty else sig
+        if g.empty:
             continue
+        y = [v.at[t, "Low"] - pad[t] if d == 1 else v.at[t, "High"] + pad[t] for t in g["date"]]
+        marks = ["✓" if st in ("Target", "Stop", "Time") and rp > 0 else
+                 "✗" if st in ("Target", "Stop", "Time") else "…"
+                 for st, rp in zip(g["status"], g.get("return_pct", pd.Series(0, index=g.index)).fillna(0))]
+        hover = []
+        for (_, r), m in zip(g.iterrows(), marks):
+            if pd.notna(r.get("entry", np.nan)):
+                hover.append(f"<b>{side} {r.setup}</b> {m}<br>signal {r.date.date()}<br>entry {r.entry:,.2f}"
+                             f"<br>stop {r.stop:,.2f}  target {r.target:,.2f}<br>{r.status}: "
+                             f"{r.return_pct:+.2f}%<extra></extra>")
+            else:
+                hover.append(f"<b>{side} {r.setup}</b><br>{r.status}<extra></extra>")
         fig.add_trace(go.Scatter(
-            x=f.index, y=y.loc[f.index], mode="markers+text", name=f"→ {txt}",
-            text=[txt if b else ""] * len(f), textposition=pos, textfont=dict(size=10, color="#3c4043"),
-            marker=dict(symbol=sym, size=13 if b else 8, color=color, line=dict(width=1, color="white")),
-            hovertemplate=[f"{d.date()} close: call → {txt}<br>score {s:+d}<extra></extra>"
-                           for d, s in zip(f.index, f.score.astype(int))]), row=1, col=1)
+            x=g["date"], y=y, mode="markers+text", name=f"{side} signal",
+            text=[f"{nm} {m}" for nm, m in zip(g["setup"], marks)],
+            textposition="bottom center" if d == 1 else "top center",
+            textfont=dict(size=10, color="#3c4043"),
+            marker=dict(symbol=sym, size=14, color=color, line=dict(width=1, color="white")),
+            hovertemplate=hover), row=1, col=1)
+    if not sig.empty and "entry" in sig:
+        tr = sig.dropna(subset=["entry"])
+        px, py = [], []
+        for _, r in tr.iterrows():
+            px += [r.entry_date, r.exit_date, None]
+            py += [r.entry, r.exit, None]
+        fig.add_trace(go.Scatter(x=px, y=py, mode="lines+markers", name="Trade path",
+                                 line=dict(color="#5f6368", width=1, dash="dot"),
+                                 marker=dict(size=4, color="#5f6368"), hoverinfo="skip"), row=1, col=1)
 
     # today's levels
     plan = todays_plan(df, pd.DataFrame(), provisional)
     x_end = v.index[-1] + pd.Timedelta(days=5)
-    lines = [("Pivot", plan["levels"]["Pivot"], "#9aa0a6")]
-    if plan["plan"]:
-        lines += [("Stop", plan["plan"]["stop"], "#c5221f"), ("T1", plan["plan"]["t1"], "#3c4043"),
-                  ("T2", plan["plan"]["t2"], "#3c4043")]
+    active = sig[sig["status"] == "Open"] if not sig.empty else sig
+    if not active.empty:
+        r = active.iloc[-1]
+        lines = [(f"{r.side} entry", r.entry, "#3c4043"), ("Stop", r.stop, "#c5221f"),
+                 ("Target", r.target, LONG_COLOR if r.dir == 1 else SHORT_COLOR)]
+    else:
+        lines = [("Pivot", plan["levels"]["Pivot"], "#9aa0a6")]
+        if plan["plan"]:
+            lines += [("Stop", plan["plan"]["stop"], "#c5221f"), ("T1", plan["plan"]["t1"], "#3c4043"),
+                      ("T2", plan["plan"]["t2"], "#3c4043")]
     for name, y, color in lines:
         fig.add_trace(go.Scatter(x=[v.index[-1], x_end], y=[y, y], mode="lines",
                                  line=dict(color=color, width=1, dash="dash"), showlegend=False,
@@ -447,10 +600,11 @@ def run_once(symbol=SYMBOL, start=START, csv_path=CSV_PATH, plot=True, show=True
         provisional = True
     else:
         intr = pd.DataFrame()
-    df = backtest(add_bias(add_indicators(df)))
+    df = backtest(add_setups(add_bias(add_indicators(df))))
     print_report(df, intr, provisional, symbol)
     if history:
         print_track_record(df.iloc[:-1] if provisional else df)
+        print_signal_history(df, provisional)
     if plot:
         plot_chart(df, provisional, symbol, show=show)
     return df
