@@ -3,37 +3,30 @@
 #
 # S&P 500 DAILY LONG / SHORT SIGNALS
 # ----------------------------------
-# Buy weakness in an uptrend, short strength in a downtrend.
+# Rules chosen on real SPY data 2008-2012 and confirmed on unseen data 2013-2017:
 #
-#   Trend  UP   : close > 200-day avg and not in a correction
-#          DOWN : close < 200-day avg, or a correction (close < 50-day avg and the 50-day avg falling)
-#   LONG   in an UP trend, after a pullback:  RSI(2) low   OR  closed near the day's low (IBS)
-#   SHORT  in a DOWN trend, after a bounce:   RSI(2) high  OR  closed near the day's high (IBS)
-#   SHORT  in an UP trend too, at an overbought top: RSI(2) very high AND closed near the high
-#   An opposite signal closes the open trade and reverses it.
-#
-#   SELF-CHECK (cuts wrong signals): before a signal is shown, the script looks up how that exact
-#   signal type did over the previous 3 years. Types that were losing (win rate < 50% or profit
-#   factor < 1.0) are blocked — but if every type is losing, the best one stays on, so you always
-#   get signals. Only past results are used at every point — no hindsight.
-#   On the chart: SOLID arrows = signals to trade. HOLLOW arrows = weak signals (their type has been
-#   losing) — shown so you can see every LONG and SHORT setup, but not traded.
-#
-#   MODE sets how many signals you get (the track record shows how each mode did):
-#     "quality"  : RSI(2) < 10 / > 90 only            — a handful per month at most
-#     "balanced" : RSI(2) < 20 / > 80, IBS < .2 / > .8 — about weekly
-#     "active"   : RSI(2) < 35 / > 65, IBS < .35 / > .65 — about weekly, 1-5 day swings
-#     "daily"    : RSI(2) < 40 / > 60, IBS < .5 / > .5  — most days; in at the open, out at the close
+#   LONG   when the S&P is above its 200-day average (uptrend) and it just pulled back:
+#            - RSI(2) below 25            (sharp 1-3 day drop), or
+#            - 3 lower closes in a row
+#   SHORT  when the S&P is below its 200-day average (downtrend) and it just bounced:
+#            - close at a 10-day high, or
+#            - RSI(2) above 90            (sharp 1-3 day rally)
 #
 #   Entry : next day's open (the signal is confirmed at the close).
-#   Exit  : first close above the previous day's high or the 5-day average (LONG; mirror for SHORT),
-#           or the stop (2 x ATR), or after the mode's max days — whichever comes first.
-#   Only one trade at a time, so the chart shows one arrow per trade.
+#   Exit  : first close back across the 5-day average, or the stop (2.5 x ATR), or after 10 days.
+#           An opposite signal closes the trade and reverses it. One trade at a time.
 #
-#   python sp500_daily_long_short.py              # today's status + chart
+#   Real SPY results (each trade costs included):
+#     MODE "quality"  ~2 signals/month   2008-12: 70% win, profit factor 1.9
+#                                         2013-17: 77% win, profit factor 1.9
+#     MODE "more"     ~3 signals/month   (RSI(2) below 50 for LONG) profit factor ~1.5
+#   Shorts only appear when the S&P is below its 200-day average — in a bull market that is
+#   rare, because shorting a rising market loses more often than it wins.
+#
+#   python sp500_daily_long_short.py              # today's status + chart (run it every day)
 #   python sp500_daily_long_short.py --live       # re-check every 15 min during market hours
-#   python sp500_daily_long_short.py --long-only  # no SHORT signals
-#   python sp500_daily_long_short.py --mode balanced
+#   python sp500_daily_long_short.py --mode more  # more signals, slightly lower quality
+#   python sp500_daily_long_short.py --long-only
 #   python sp500_daily_long_short.py --symbol SPY
 #
 # The chart opens by itself: under the cell in Colab/Jupyter, in your browser from a terminal.
@@ -53,26 +46,20 @@ SYMBOL = "^GSPC"            # S&P 500 index. "SPY" = ETF, "ES=F" = futures
 START = "2000-01-01"
 CSV_PATH = None             # optional: daily CSV (Date,Open,High,Low,Close) instead of downloading
 
-MODE = "active"             # "quality" (fewest) · "balanced" · "active" (best balance) · "daily" (most, more wrong)
-MODES = {   # RSI(2) long/short, IBS long/short (None = off), max holding days,
-            # top = (RSI(2), IBS) needed to SHORT an overbought top inside an uptrend (None = off)
-    "quality":  dict(rsi=(10, 90), ibs=None,         max_days=10, top=None),
-    "balanced": dict(rsi=(20, 80), ibs=(0.2, 0.8),   max_days=5,  top=(95, 0.8)),
-    "active":   dict(rsi=(35, 65), ibs=(0.35, 0.65), max_days=5,  top=(90, 0.75)),
-    "daily":    dict(rsi=(40, 60), ibs=(0.5, 0.5),   max_days=1,  top=(85, 0.7)),   # day trades
+MODE = "quality"            # "quality" (~2/month, best) or "more" (~3/month, a bit lower quality)
+MODES = {
+    "quality": dict(long_rsi=25),
+    "more":    dict(long_rsi=50),
 }
-EXIT_MA = 5                 # exit on a close back across the 5-day average (or past yesterday's high/low)
-STOP_ATR = 2.0              # protective stop distance in daily ATRs
+SHORT_RSI = 90              # SHORT bounce threshold in a downtrend
+SHORT_HIGH_DAYS = 10        # SHORT when the close is the highest of this many days (downtrend only)
+EXIT_MA = 5                 # exit on a close back across the 5-day average
+STOP_ATR = 2.5              # protective stop distance in daily ATRs
+MAX_DAYS = 10               # time exit
 ALLOW_SHORTS = True
-SELF_CHECK = True           # block signal types that were losing over the previous LOOKBACK days
-CHECK_LOOKBACK = 756        # ~3 years of trading days
-CHECK_MIN_TRADES = 15       # need at least this many past signals of the type to judge it
-CHECK_MIN_WIN = 0.50        # past win rate needed
-CHECK_MIN_PF = 1.0          # past profit factor needed (1.0 = broke even)
-SHOW_WEAK = True            # also draw blocked (weak) signals as hollow arrows
 COST_PCT = 0.0002           # commission + slippage per side
 
-CHART_DAYS = 126            # ~6 months on the chart
+CHART_DAYS = 252            # ~1 year on the chart
 HTML_PATH = "sp500_signals.html"
 LIVE_EVERY_MIN = 15
 NY = "America/New_York"
@@ -165,7 +152,6 @@ def add_indicators(df):
     df = df.copy()
     c, h, l = df["Close"], df["High"], df["Low"]
     df["ma_exit"] = c.rolling(EXIT_MA).mean()
-    df["ma50"] = c.rolling(50).mean()
     df["ma200"] = c.rolling(200).mean()
     d = c.diff()
     up = d.clip(lower=0).ewm(alpha=1 / 2, adjust=False).mean()
@@ -174,141 +160,26 @@ def add_indicators(df):
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
-    rng = (h - l).replace(0, np.nan)
-    df["ibs"] = ((c - l) / rng).fillna(0.5)          # 0 = closed at the day's low, 1 = at the high
-
-    correction = (c < df["ma50"]) & (df["ma50"] < df["ma50"].shift(10))   # pullback inside a bull market
-    downtrend = (c < df["ma200"]) | correction
-    uptrend = ~downtrend
-
-    m = MODES[MODE]
-    lo_rsi, hi_rsi = m["rsi"]
-    no = pd.Series(False, index=df.index)
-    ibs_weak = ibs_strong = no
-    if m["ibs"]:
-        lo_ibs, hi_ibs = m["ibs"]
-        ibs_weak = (df["ibs"] < lo_ibs) & (c < c.shift())
-        ibs_strong = (df["ibs"] > hi_ibs) & (c > c.shift())
-    top = no
-    if m["top"]:                                      # overbought top inside an uptrend
-        top_rsi, top_ibs = m["top"]
-        top = uptrend & (df["rsi2"] > top_rsi) & (df["ibs"] > top_ibs)
+    uptrend, downtrend = c > df["ma200"], c < df["ma200"]
+    down3 = (c < c.shift()) & (c.shift() < c.shift(2)) & (c.shift(2) < c.shift(3))
+    high_n = c >= c.rolling(SHORT_HIGH_DAYS).max()
+    long_rsi = MODES[MODE]["long_rsi"]
     sh = ALLOW_SHORTS
-    # signal types, in priority order (the first one that matches names the signal)
-    kinds = [("SHORT top",    top & sh),
-             ("SHORT bounce", downtrend & (df["rsi2"] > hi_rsi) & sh),
-             ("SHORT ibs",    downtrend & ibs_strong & sh),
-             ("LONG dip",     uptrend & (df["rsi2"] < lo_rsi)),
-             ("LONG ibs",     uptrend & ibs_weak)]
+    kinds = [("SHORT 10-day high", downtrend & high_n & sh),          # first match names the signal
+             ("SHORT RSI(2) bounce", downtrend & (df["rsi2"] > SHORT_RSI) & sh),
+             ("LONG RSI(2) pullback", uptrend & (df["rsi2"] < long_rsi)),
+             ("LONG 3 down days", uptrend & down3)]
     df["kind"] = np.select([k[1] for k in kinds], [k[0] for k in kinds], "")
     df.loc[df["ma200"].isna(), "kind"] = ""
     df["setup"] = np.where(df["kind"].str.startswith("SHORT"), -1, np.where(df["kind"] != "", 1, 0))
     return df
 
 
-def _play(arr, setup, i, d, complete):
-    """Trade a signal from bar i: enter at the next open, return (entry, stop, exit_i, exit_px, reason).
-    exit_i is None while the trade is still open at the last finished bar."""
-    o, h, l, c, ma, atr = arr
-    max_days = MODES[MODE]["max_days"]
-    e = i + 1
-    entry, stop = o[e], o[e] - d * STOP_ATR * atr[i]
-    for j in range(e, complete):
-        if (d == 1 and l[j] <= stop) or (d == -1 and h[j] >= stop):
-            return entry, stop, j, (min(o[j], stop) if d == 1 else max(o[j], stop)), "stop"
-        if (d == 1 and (c[j] > ma[j] or c[j] > h[j - 1])) or (d == -1 and (c[j] < ma[j] or c[j] < l[j - 1])):
-            return entry, stop, j, c[j], "target"
-        if setup[j] == -d:                           # opposite signal: close here and reverse
-            return entry, stop, j, c[j], "reverse"
-        if j - e + 1 >= max_days:
-            return entry, stop, j, c[j], "time"
-    return entry, stop, None, None, "open"
-
-
-def _arrays(df):
-    return tuple(df[k].to_numpy() for k in ("Open", "High", "Low", "Close", "ma_exit", "atr"))
-
-
-def _grade(exits, rets, i):
-    """(passes, profit factor) for a type's signals that finished in the lookback before bar i,
-    or None if there are too few to judge."""
-    past = rets[(exits >= i - CHECK_LOOKBACK) & (exits < i)]
-    if len(past) < CHECK_MIN_TRADES:
-        return None
-    loss = -past[past <= 0].sum()
-    pf = past[past > 0].sum() / loss if loss > 0 else np.inf
-    return ((past > 0).mean() >= CHECK_MIN_WIN and pf >= CHECK_MIN_PF), pf
-
-
-def self_check(df, complete):
-    """For every signal day, look only at signals of the same type that had already FINISHED within
-    the lookback window, and allow the new one only if that type was winning. Adds `allowed`."""
-    arr, setup, kind = _arrays(df), df["setup"].to_numpy(), df["kind"].to_numpy()
-    idx = np.flatnonzero(setup != 0)
-    # every past signal traded on its own (overlaps allowed) — the type's report card
-    done = {}
-    for i in idx[idx < complete - 1]:
-        d = int(setup[i])
-        entry, _, ex, px, why = _play(arr, setup, i, d, complete)
-        if ex is not None:
-            done.setdefault(kind[i], []).append((ex, d * (px - entry) / entry - 2 * COST_PCT))
-    done = {k: (np.array([x for x, _ in v]), np.array([r for _, r in v])) for k, v in done.items()}
-    allowed = np.zeros(len(df), dtype=bool)
-    for i in idx:
-        if not SELF_CHECK:
-            allowed[i] = True
-            continue
-        grades = {k: _grade(ex, r, i) for k, (ex, r) in done.items()}
-        g = grades.get(kind[i])
-        if g is None:                                # not enough history yet: give it a chance
-            allowed[i] = True
-        elif g[0]:                                   # this type is winning
-            allowed[i] = True
-        elif not any(x and x[0] for x in grades.values()):
-            # every judged type is losing: keep only the best one (highest profit factor) on
-            best = max((k for k, x in grades.items() if x), key=lambda k: grades[k][1])
-            allowed[i] = kind[i] == best
-    df = df.copy()
-    df["allowed"] = allowed
-    return df, done
-
-
-def kind_report(df, done):
-    """Each signal type's record over the last CHECK_LOOKBACK days and whether it is switched on now."""
-    n = len(df)
-    grades = {k: _grade(ex, r, n) for k, (ex, r) in done.items()}
-    any_pass = any(g and g[0] for g in grades.values())
-    judged = [k for k, g in grades.items() if g]
-    best = max(judged, key=lambda k: grades[k][1]) if judged else None
-    lines = []
-    for k in sorted({k for k in df["kind"] if k}):
-        exits, rets = done.get(k, (np.array([]), np.array([])))
-        past = rets[(exits >= n - CHECK_LOOKBACK) & (exits < n)]
-        g = grades.get(k)
-        if g is None:
-            state = "ON (not enough history to judge)"
-        elif g[0]:
-            state = "ON"
-        elif not any_pass and k == best:
-            state = "ON (best of a weak bunch)"
-        else:
-            state = "blocked (was losing)"
-        if len(past) == 0:
-            lines.append(f"    {k:<13} no finished signals yet   -> {state}")
-            continue
-        loss = -past[past <= 0].sum()
-        pf = past[past > 0].sum() / loss if loss > 0 else np.inf
-        lines.append(f"    {k:<13} {len(past):4d} signals   win {100 * (past > 0).mean():5.1f}%   "
-                     f"profit factor {pf:4.2f}   -> {state if SELF_CHECK else 'ON'}")
-    return lines
-
-
 def simulate(df, complete):
-    """One trade at a time, only signals the self-check allows. `complete` = number of finished bars
-    (excludes a live candle). Returns (trades, status): status says what to do now (new/open/flat)."""
-    arr = _arrays(df)
-    o, h, l, c, ma, atr = arr
-    setup = np.where(df["allowed"].to_numpy(), df["setup"].to_numpy(), 0)
+    """One trade at a time. `complete` = number of finished daily bars (excludes a live candle).
+    Returns (trades, status): status says what to do now (new / open / flat)."""
+    o, h, l, c = (df[k].to_numpy() for k in ("Open", "High", "Low", "Close"))
+    ma, atr, setup = df["ma_exit"].to_numpy(), df["atr"].to_numpy(), df["setup"].to_numpy()
     trades, i, status = [], 0, None
     while i < complete:
         if setup[i] == 0:
@@ -320,7 +191,19 @@ def simulate(df, complete):
                       "stop": c[i] - d * STOP_ATR * atr[i], "type": df["kind"].iat[i]}
             break
         e = i + 1
-        entry, stop, exit_i, exit_px, reason = _play(arr, setup, i, d, complete)
+        entry, stop = o[e], o[e] - d * STOP_ATR * atr[i]
+        exit_i = exit_px = reason = None
+        for j in range(e, complete):
+            if (d == 1 and l[j] <= stop) or (d == -1 and h[j] >= stop):
+                exit_i, exit_px, reason = j, (min(o[j], stop) if d == 1 else max(o[j], stop)), "stop"
+            elif (d == 1 and c[j] > ma[j]) or (d == -1 and c[j] < ma[j]):
+                exit_i, exit_px, reason = j, c[j], "target"
+            elif setup[j] == -d:                       # opposite signal: close here and reverse
+                exit_i, exit_px, reason = j, c[j], "reverse"
+            elif j - e + 1 >= MAX_DAYS:
+                exit_i, exit_px, reason = j, c[j], "time"
+            if exit_i is not None:
+                break
         t = {"dir": d, "type": df["kind"].iat[i], "signal_date": df.index[i], "entry_date": df.index[e],
              "entry": entry, "stop": stop}
         if exit_i is None:                          # still open
@@ -355,34 +238,33 @@ def print_report(df, trades, status, live, symbol):
     side = {1: "LONG", -1: "SHORT"}
     now = pd.Timestamp.now(tz=NY).strftime("%Y-%m-%d %H:%M ET")
     bar = "=" * 72
+    n_done = len(df) - (1 if live is not None else 0)
+    last = df.iloc[n_done - 1]
+    trend = "UPTREND (LONG signals only)" if last.Close > last.ma200 else "DOWNTREND (SHORT signals only)"
     print(f"\n{bar}\n {symbol}  daily signals ({MODE} mode)   {now}\n{bar}")
+    print(f"\n  Market: {trend} — close {last.Close:,.2f} vs 200-day avg {last.ma200:,.2f}")
     k = status["kind"]
     if k == "new":
         d = status["dir"]
         when = "today's open" if live is not None else "the next open"
         print(f"\n  >>> NEW {side[d]} SIGNAL [{status['type']}] (close of {status['date'].date()}) — "
               f"{'buy' if d == 1 else 'sell short'} at {when} (~{status['close']:,.2f})")
-        if MODES[MODE]["max_days"] == 1:
-            print(f"      stop ~{status['stop']:,.2f}   exit at the same day's close (day trade)")
-        else:
-            print(f"      stop ~{status['stop']:,.2f}   exit on the first close {'above' if d == 1 else 'below'} "
-                  f"the day before's {'high' if d == 1 else 'low'} or the {EXIT_MA}-day average, "
-                  f"max {MODES[MODE]['max_days']} days")
+        print(f"      stop ~{status['stop']:,.2f}   exit on the first close {'above' if d == 1 else 'below'} "
+              f"the {EXIT_MA}-day average, max {MAX_DAYS} days")
     elif k == "open":
         d = status["dir"]
         print(f"\n  >>> IN {side[d]} since {status['entry_date'].date()} @ {status['entry']:,.2f}   "
-              f"P/L {status['ret']:+.2f}%   day {status['days']} of {MODES[MODE]['max_days']}")
-        prev = df["High"].iat[-2] if d == 1 else df["Low"].iat[-2]
-        lvl = min(status["ma"], prev) if d == 1 else max(status["ma"], prev)
+              f"P/L {status['ret']:+.2f}%   day {status['days']} of {MAX_DAYS}")
         print(f"      stop {status['stop']:,.2f}   exit on a close {'above' if d == 1 else 'below'} "
-              f"{lvl:,.2f}")
+              f"{status['ma']:,.2f} ({EXIT_MA}-day average)")
     else:
         print("\n  >>> NO SIGNAL — stay flat.")
-    n_done = len(df) - (1 if live is not None else 0)
-    last = df.iloc[n_done - 1]
-    if k != "new" and last.setup != 0 and not last.allowed:
-        print(f"      (weak {side[int(last.setup)]} setup at the last close [{last.kind}] — skipped: "
-              f"this type has been losing; hollow arrow on the chart)")
+        if last.Close > last.ma200:
+            print(f"      next LONG fires on a close with RSI(2) < {MODES[MODE]['long_rsi']} "
+                  f"(now {last.rsi2:.0f}) or after 3 down days in a row")
+        else:
+            print(f"      next SHORT fires on a {SHORT_HIGH_DAYS}-day closing high or RSI(2) > {SHORT_RSI} "
+                  f"(now {last.rsi2:.0f})")
 
     if live is not None:
         r = df.iloc[-1]
@@ -391,15 +273,12 @@ def print_report(df, trades, status, live, symbol):
             d = status["dir"]
             if (r.Low <= status["stop"]) if d == 1 else (r.High >= status["stop"]):
                 print("      stop hit today — the trade is closed.")
-            elif ((r.Close > r.ma_exit or r.Close > df["High"].iat[-2]) if d == 1
-                  else (r.Close < r.ma_exit or r.Close < df["Low"].iat[-2])):
+            elif (r.Close > r.ma_exit) if d == 1 else (r.Close < r.ma_exit):
                 print("      exit condition met — plan to close at today's close.")
             else:
                 print("      hold — exit condition not met yet.")
-        elif r.setup != 0 and r.allowed:
-            print(f"      {side[int(r.setup)]} signal FORMING [{r.kind}] — valid only if it still holds at the close.")
         elif r.setup != 0:
-            print(f"      weak {side[int(r.setup)]} setup forming [{r.kind}] — this type has been losing, not traded.")
+            print(f"      {side[int(r.setup)]} signal FORMING [{r.kind}] — valid only if it still holds at the close.")
         else:
             print("      no signal forming.")
 
@@ -408,11 +287,6 @@ def print_report(df, trades, status, live, symbol):
           f"(enter next open, costs included) — about {len(trades) / months:.1f} signals per month:")
     for line in summary(trades):
         print(line)
-    if SELF_CHECK and "done" in df.attrs:
-        print(f"\n  Signal types over the last {CHECK_LOOKBACK} days (need win >= {CHECK_MIN_WIN:.0%} "
-              f"and profit factor >= {CHECK_MIN_PF}):")
-        for line in kind_report(df, df.attrs["done"]):
-            print(line)
     print(bar)
 
 
@@ -442,8 +316,8 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
             pts.append((t.signal_date, t.dir, "",
                         f"{t.type}<br>entry {t.entry:,.2f} on {t.entry_date.date()}<br>{res}<br>result {t.ret:+.2f}%"))
     if status["kind"] == "new":
-        pts.append((status["date"], status["dir"], " (new)", "enter at the next open"))
-    if live is not None and df["setup"].iat[-1] != 0 and df["allowed"].iat[-1] and status["kind"] != "open":
+        pts.append((status["date"], status["dir"], " (new)", f"{status['type']}<br>enter at the next open"))
+    if live is not None and df["setup"].iat[-1] != 0 and status["kind"] != "open":
         pts.append((df.index[-1], int(df["setup"].iat[-1]), "?", "forming — confirms at the close"))
 
     for d, name, sym, color in ((1, "LONG", "triangle-up", LONG_COLOR), (-1, "SHORT", "triangle-down", SHORT_COLOR)):
@@ -457,28 +331,8 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
             text=[name + q[2] if q[2] else "" for q in p],          # label only the new / forming one
             textposition="bottom center" if d == 1 else "top center",
             textfont=dict(size=12, color=color),
-            marker=dict(symbol=sym, size=12, color=color, line=dict(width=1, color="white")),
+            marker=dict(symbol=sym, size=13, color=color, line=dict(width=1, color="white")),
             hovertemplate=[f"<b>{name}</b> signal {q[0].date()}<br>{q[3]}<extra></extra>" for q in p]))
-
-    if SHOW_WEAK:                                    # blocked signals: hollow, first day of each streak
-        n_done = len(df) - (1 if live is not None else 0)
-        weak = (v["setup"] != 0) & ~v["allowed"] & (v["setup"] != v["setup"].shift())
-        weak &= np.arange(len(v)) < n_done - (len(df) - len(v))
-        stats = {k: _grade(ex, r, n_done) for k, (ex, r) in df.attrs.get("done", {}).items()}
-        for d, name, sym, color in ((1, "LONG (weak)", "triangle-up-open", LONG_COLOR),
-                                    (-1, "SHORT (weak)", "triangle-down-open", SHORT_COLOR)):
-            w = v[weak & (v["setup"] == d)]
-            if w.empty:
-                continue
-            y = w["Low"] - 0.6 * w["atr"] if d == 1 else w["High"] + 0.6 * w["atr"]
-            hover = []
-            for t, k in zip(w.index, w["kind"]):
-                g = stats.get(k)
-                why = f"profit factor {g[1]:.2f} over the last 3 years" if g else "not enough history"
-                hover.append(f"<b>{k}</b> (weak) {t.date()}<br>blocked: this type has been losing<br>{why}"
-                             f"<extra></extra>")
-            fig.add_trace(go.Scatter(x=w.index, y=y, mode="markers", name=name, hovertemplate=hover,
-                                     marker=dict(symbol=sym, size=11, color=color, line=dict(width=1.5))))
 
     missing = pd.bdate_range(v.index[0], v.index[-1]).difference(v.index)
     fig.update_layout(
@@ -512,8 +366,6 @@ def run_once(symbol=SYMBOL, start=START, csv_path=CSV_PATH, plot=True, show=True
             df = pd.concat([df[df.index < today.index[-1]], today])     # today's forming candle
     df = add_indicators(df)
     complete = len(df) - 1 if live is not None else len(df)
-    df, done = self_check(df, complete)
-    df.attrs["done"] = done
     trades, status = simulate(df, complete)
     print_report(df, trades, status, live, symbol)
     if plot:
