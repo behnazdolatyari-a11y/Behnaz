@@ -8,7 +8,8 @@
 #
 #   LONG   uptrend   : close > 200-day avg, 50-day avg > 200-day avg, 200-day avg rising
 #          pullback  : RSI(2) < 10  (2-3 sharp down days)
-#   SHORT  downtrend : close < 200-day avg, 50-day avg < 200-day avg, 200-day avg falling
+#   SHORT  downtrend : bear market  (close < 200-day avg, 50-day avg < 200-day avg, 200-day falling)
+#                      or correction (close < 50-day avg and the 50-day avg falling)
 #          bounce    : RSI(2) > 90  (2-3 sharp up days)
 #
 #   Entry : next day's open (the signal is confirmed at the close).
@@ -150,7 +151,9 @@ def add_indicators(df):
 
     rising = df["ma200"] > df["ma200"].shift(20)
     uptrend = (c > df["ma200"]) & (df["ma50"] > df["ma200"]) & rising
-    downtrend = (c < df["ma200"]) & (df["ma50"] < df["ma200"]) & ~rising
+    bear = (c < df["ma200"]) & (df["ma50"] < df["ma200"]) & ~rising
+    correction = (c < df["ma50"]) & (df["ma50"] < df["ma50"].shift(10))   # pullback inside a bull market
+    downtrend = bear | correction
     df["setup"] = np.select([uptrend & (df["rsi2"] < LONG_RSI),
                              downtrend & (df["rsi2"] > SHORT_RSI) & ALLOW_SHORTS], [1, -1], 0)
     df.loc[df["ma200"].shift(20).isna(), "setup"] = 0
