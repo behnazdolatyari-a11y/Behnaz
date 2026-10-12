@@ -5,11 +5,12 @@
 # ----------------------------------
 # Buy weakness in an uptrend, short strength in a downtrend.
 #
-#   Trend  UP   : close > 200-day avg and the 50-day avg is not falling below price
-#          DOWN : bear market  (close < 200-day avg, 50-day avg < 200-day avg)
-#                 or correction (close < 50-day avg and the 50-day avg falling)
+#   Trend  UP   : close > 200-day avg and not in a correction
+#          DOWN : close < 200-day avg, or a correction (close < 50-day avg and the 50-day avg falling)
 #   LONG   in an UP trend, after a pullback:  RSI(2) low   OR  closed near the day's low (IBS)
 #   SHORT  in a DOWN trend, after a bounce:   RSI(2) high  OR  closed near the day's high (IBS)
+#   SHORT  in an UP trend too, at an overbought top: RSI(2) very high AND closed near the high
+#   An opposite signal closes the open trade and reverses it.
 #
 #   MODE sets how many signals you get (the track record shows how each mode did):
 #     "quality"  : RSI(2) < 10 / > 90 only            — a handful per month at most
@@ -46,11 +47,12 @@ START = "2000-01-01"
 CSV_PATH = None             # optional: daily CSV (Date,Open,High,Low,Close) instead of downloading
 
 MODE = "daily"              # "quality" (fewest, strongest) · "balanced" · "active" · "daily" (most days)
-MODES = {   # RSI(2) long/short, IBS long/short (None = off), max holding days
-    "quality":  dict(rsi=(10, 90), ibs=None,       max_days=10),
-    "balanced": dict(rsi=(20, 80), ibs=(0.2, 0.8), max_days=5),
-    "active":   dict(rsi=(35, 65), ibs=(0.35, 0.65), max_days=5),
-    "daily":    dict(rsi=(40, 60), ibs=(0.5, 0.5),   max_days=1),   # day trade: out at the same day's close
+MODES = {   # RSI(2) long/short, IBS long/short (None = off), max holding days,
+            # top = (RSI(2), IBS) needed to SHORT an overbought top inside an uptrend (None = off)
+    "quality":  dict(rsi=(10, 90), ibs=None,         max_days=10, top=None),
+    "balanced": dict(rsi=(20, 80), ibs=(0.2, 0.8),   max_days=5,  top=(95, 0.8)),
+    "active":   dict(rsi=(35, 65), ibs=(0.35, 0.65), max_days=5,  top=(90, 0.75)),
+    "daily":    dict(rsi=(40, 60), ibs=(0.5, 0.5),   max_days=1,  top=(85, 0.7)),   # day trades
 }
 EXIT_MA = 5                 # exit on a close back across the 5-day average (or past yesterday's high/low)
 STOP_ATR = 2.0              # protective stop distance in daily ATRs
@@ -162,10 +164,9 @@ def add_indicators(df):
     rng = (h - l).replace(0, np.nan)
     df["ibs"] = ((c - l) / rng).fillna(0.5)          # 0 = closed at the day's low, 1 = at the high
 
-    bear = (c < df["ma200"]) & (df["ma50"] < df["ma200"])
     correction = (c < df["ma50"]) & (df["ma50"] < df["ma50"].shift(10))   # pullback inside a bull market
-    downtrend = bear | correction
-    uptrend = (c > df["ma200"]) & ~correction
+    downtrend = (c < df["ma200"]) | correction
+    uptrend = ~downtrend
 
     m = MODES[MODE]
     lo_rsi, hi_rsi = m["rsi"]
@@ -174,7 +175,11 @@ def add_indicators(df):
         lo_ibs, hi_ibs = m["ibs"]
         weak |= (df["ibs"] < lo_ibs) & (c < c.shift())
         strong |= (df["ibs"] > hi_ibs) & (c > c.shift())
-    df["setup"] = np.select([uptrend & weak, downtrend & strong & ALLOW_SHORTS], [1, -1], 0)
+    short = downtrend & strong
+    if m["top"]:                                      # overbought top inside an uptrend
+        top_rsi, top_ibs = m["top"]
+        short |= uptrend & (df["rsi2"] > top_rsi) & (df["ibs"] > top_ibs)
+    df["setup"] = np.select([short & ALLOW_SHORTS, uptrend & weak], [-1, 1], 0)
     df.loc[df["ma200"].isna(), "setup"] = 0
     return df
 
@@ -203,6 +208,8 @@ def simulate(df, complete):
                 exit_i, exit_px, reason = j, (min(o[j], stop) if d == 1 else max(o[j], stop)), "stop"
             elif (d == 1 and (c[j] > ma[j] or c[j] > h[j - 1])) or (d == -1 and (c[j] < ma[j] or c[j] < l[j - 1])):
                 exit_i, exit_px, reason = j, c[j], "target"
+            elif setup[j] == -d:                       # opposite signal: close here and reverse
+                exit_i, exit_px, reason = j, c[j], "reverse"
             elif j - e + 1 >= max_days:
                 exit_i, exit_px, reason = j, c[j], "time"
             if exit_i is not None:
