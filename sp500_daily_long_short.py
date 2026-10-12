@@ -11,6 +11,9 @@
 #   python sp500_daily_long_short.py --live          # re-check every 15 min during market hours
 #   python sp500_daily_long_short.py --long-only     # SHORT calls become STAY OUT
 #
+# The chart opens by itself: under the cell in Colab/Jupyter, in your web browser from a terminal.
+# It is also saved as sp500_daily_bias.html next to where you ran the script.
+#
 # Before the open : the call comes from yesterday's close (final, does not change during the day).
 # During the day  : the script rebuilds today's daily candle from live 5-minute data and shows
 #                   (1) whether price action confirms the call (above/below today's open and VWAP)
@@ -20,7 +23,9 @@
 # so the track record printed under the call is what the rules would actually have done.
 
 import argparse
+import os
 import time
+import webbrowser
 import warnings
 from datetime import datetime
 warnings.filterwarnings("ignore")
@@ -315,7 +320,16 @@ def print_report(df, intr, provisional, symbol=SYMBOL):
 
 
 # ---------------------------------------------------------------- chart
-def plot_chart(df, provisional, symbol=SYMBOL, days=CHART_DAYS, html_path=HTML_PATH, show=False):
+def in_notebook():
+    """True inside Colab / Jupyter, where the chart can be drawn right under the cell."""
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None and "IPKernelApp" in get_ipython().config
+    except Exception:
+        return False
+
+
+def plot_chart(df, provisional, symbol=SYMBOL, days=CHART_DAYS, html_path=HTML_PATH, show=True):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -413,15 +427,18 @@ def plot_chart(df, provisional, symbol=SYMBOL, days=CHART_DAYS, html_path=HTML_P
     fig.update_yaxes(dtick=3, row=2, col=1)
 
     if html_path:
-        fig.write_html(html_path, include_plotlyjs="cdn")
-        print(f"Chart saved to {html_path}")
+        fig.write_html(html_path, include_plotlyjs=True)      # self-contained, opens offline too
+        print(f"Chart saved to {os.path.abspath(html_path)}")
     if show:
-        fig.show()
+        if in_notebook():
+            fig.show()                                         # Colab / Jupyter: draws under the cell
+        elif html_path:
+            webbrowser.open("file://" + os.path.abspath(html_path))   # terminal: opens your browser
     return fig
 
 
 # ---------------------------------------------------------------- run
-def run_once(symbol=SYMBOL, start=START, csv_path=CSV_PATH, plot=True, show=False, history=True):
+def run_once(symbol=SYMBOL, start=START, csv_path=CSV_PATH, plot=True, show=True, history=True):
     df = fetch_daily(symbol, start, csv_path)
     intr = pd.DataFrame() if csv_path else fetch_intraday(symbol)
     provisional = False
@@ -443,6 +460,9 @@ def run_live(symbol=SYMBOL, every_min=LIVE_EVERY_MIN, **kw):
     first = True
     while True:
         if market_open_now() or first:
+            if in_notebook() and not first:
+                from IPython.display import clear_output
+                clear_output(wait=True)                        # replace the old report + chart
             run_once(symbol, history=first, **kw)
             first = False
         else:
@@ -459,11 +479,11 @@ if __name__ == "__main__":
     ap.add_argument("--every", type=int, default=LIVE_EVERY_MIN)
     ap.add_argument("--long-only", action="store_true")
     ap.add_argument("--no-plot", action="store_true")
-    ap.add_argument("--show", action="store_true", help="also open the chart (fig.show)")
+    ap.add_argument("--no-open", action="store_true", help="save the chart but don't open/show it")
     args, _ = ap.parse_known_args()       # parse_known_args so it also runs inside Colab/Jupyter
     if args.long_only:
         ALLOW_SHORTS = False
-    kw = dict(start=args.start, csv_path=args.csv, plot=not args.no_plot, show=args.show)
+    kw = dict(start=args.start, csv_path=args.csv, plot=not args.no_plot, show=not args.no_open)
     if args.live:
         run_live(args.symbol, args.every, **kw)
     else:
