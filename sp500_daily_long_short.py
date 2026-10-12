@@ -1,40 +1,36 @@
 # Run this once in your terminal or Colab cell (with the ! prefix) before running the script:
 # pip install -U yfinance plotly pandas numpy
 #
-# S&P 500 DAILY LONG / SHORT SIGNALS
-# ----------------------------------
+# S&P 500 DAILY LONG / SHORT SIGNALS — with intraday take-profit
+# ---------------------------------------------------------------
 # Rules chosen on real SPY data 2008-2012 and confirmed on unseen data 2013-2017:
 #
-#   LONG   when the S&P is above its 200-day average (uptrend) and it just pulled back:
-#            - RSI(2) below 25            (sharp 1-3 day drop), or
-#            - 3 lower closes in a row
+#   LONG   when the S&P is in an uptrend (close and 50-day avg both above the 200-day avg)
+#          and it just pulled back:  RSI(2) below 25   or   3 lower closes in a row
 #   SHORT  when the S&P is below its 200-day average (downtrend) and it just bounced:
-#            - close at a 10-day high, or
-#            - RSI(2) above 90            (sharp 1-3 day rally)
+#          close at a 10-day high   or   RSI(2) above 90
 #
-#   Entry : next day's open (the signal is confirmed at the close).
-#   Exit  : first close back across the 5-day average, or the stop (2.5 x ATR), or after 10 days.
-#           An opposite signal closes the trade and reverses it. One trade at a time.
+#   Entry  : next day's open.
+#   Exits  : 1) TAKE PROFIT intraday — a limit order at entry +/- 0.35 x ATR (about a third of a
+#               normal day's range); place it right after you get filled
+#            2) otherwise the first close in profit
+#            3) STOP at 2.5 x ATR, an opposite signal, or 10 days — whichever comes first
+#   One trade at a time.
 #
-#   Real SPY results (each trade costs included):
-#     MODE "quality"  ~2 signals/month   2008-12: 70% win, profit factor 1.9
-#                                         2013-17: 77% win, profit factor 1.9
-#     MODE "more"     ~3 signals/month   (RSI(2) below 50 for LONG) profit factor ~1.5
-#   Shorts only appear when the S&P is below its 200-day average — in a bull market that is
-#   rare, because shorting a rising market loses more often than it wins.
+#   Real SPY results (costs included; a limit counts as filled when the day's range touched it):
+#     MODE "quality"  ~2.5 signals/month   2008-12: 91% win, PF 2.3   2013-17: 90% win, PF 1.7
+#     MODE "more"     ~4 signals/month     2008-12: 89% win, PF 1.7   2013-17: 89% win, PF 1.7
+#   Wins are small and frequent, losses rarer but bigger — so always use the stop.
+#   Shorts only appear when the S&P is below its 200-day average (rare in a bull market).
 #
-#   Why some arrows LOOK wrong: these signals buy a drop (or short a rally) while it is happening.
-#   On real SPY ~40% of signals moved further against the arrow for a day or two — yet only ~25%
-#   ended as a loss. Waiting for price to turn first was tested and made results much worse.
-#   The chart marks every finished signal: ✓ = made money, ✗ = lost money.
-#
-#   python sp500_daily_long_short.py              # today's status + chart (run it every day)
-#   python sp500_daily_long_short.py --live       # re-check every 15 min during market hours
-#   python sp500_daily_long_short.py --mode more  # more signals, slightly lower quality
+#   python sp500_daily_long_short.py              # daily: today's instruction + chart
+#   python sp500_daily_long_short.py --live       # INTRADAY: re-checks every 15 min while the market
+#                                                 # is open — target hit? stop hit? signal forming?
+#   python sp500_daily_long_short.py --mode more  # more signals
 #   python sp500_daily_long_short.py --long-only
-#   python sp500_daily_long_short.py --symbol SPY
 #
 # The chart opens by itself: under the cell in Colab/Jupyter, in your browser from a terminal.
+# On the chart: ✓ = trade made money, ✗ = lost money.
 
 import argparse
 import os
@@ -51,14 +47,14 @@ SYMBOL = "^GSPC"            # S&P 500 index. "SPY" = ETF, "ES=F" = futures
 START = "2000-01-01"
 CSV_PATH = None             # optional: daily CSV (Date,Open,High,Low,Close) instead of downloading
 
-MODE = "quality"            # "quality" (~2/month, best) or "more" (~3/month, a bit lower quality)
+MODE = "quality"            # "quality" (~2.5/month, best) or "more" (~4/month)
 MODES = {
     "quality": dict(long_rsi=25),
     "more":    dict(long_rsi=50),
 }
+TARGET_ATR = 0.35           # intraday take-profit limit = entry +/- 0.35 x ATR
 SHORT_RSI = 90              # SHORT bounce threshold in a downtrend
 SHORT_HIGH_DAYS = 10        # SHORT when the close is the highest of this many days (downtrend only)
-EXIT_MA = 5                 # exit on a close back across the 5-day average
 STOP_ATR = 2.5              # protective stop distance in daily ATRs
 MAX_DAYS = 10               # time exit
 ALLOW_SHORTS = True
@@ -156,7 +152,7 @@ def market_open_now():
 def add_indicators(df):
     df = df.copy()
     c, h, l = df["Close"], df["High"], df["Low"]
-    df["ma_exit"] = c.rolling(EXIT_MA).mean()
+    df["ma50"] = c.rolling(50).mean()
     df["ma200"] = c.rolling(200).mean()
     d = c.diff()
     up = d.clip(lower=0).ewm(alpha=1 / 2, adjust=False).mean()
@@ -165,7 +161,8 @@ def add_indicators(df):
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
-    uptrend, downtrend = c > df["ma200"], c < df["ma200"]
+    uptrend = (c > df["ma200"]) & (df["ma50"] > df["ma200"])
+    downtrend = c < df["ma200"]
     down3 = (c < c.shift()) & (c.shift() < c.shift(2)) & (c.shift(2) < c.shift(3))
     high_n = c >= c.rolling(SHORT_HIGH_DAYS).max()
     long_rsi = MODES[MODE]["long_rsi"]
@@ -184,7 +181,7 @@ def simulate(df, complete):
     """One trade at a time. `complete` = number of finished daily bars (excludes a live candle).
     Returns (trades, status): status says what to do now (new / open / flat)."""
     o, h, l, c = (df[k].to_numpy() for k in ("Open", "High", "Low", "Close"))
-    ma, atr, setup = df["ma_exit"].to_numpy(), df["atr"].to_numpy(), df["setup"].to_numpy()
+    atr, setup = df["atr"].to_numpy(), df["setup"].to_numpy()
     trades, i, status = [], 0, None
     while i < complete:
         if setup[i] == 0:
@@ -192,17 +189,22 @@ def simulate(df, complete):
             continue
         d = int(setup[i])
         if i == complete - 1:                       # signal at the last finished close
-            status = {"kind": "new", "dir": d, "date": df.index[i], "close": c[i],
-                      "stop": c[i] - d * STOP_ATR * atr[i], "type": df["kind"].iat[i]}
+            status = {"kind": "new", "dir": d, "date": df.index[i], "close": c[i], "atr": atr[i],
+                      "stop": c[i] - d * STOP_ATR * atr[i], "target": c[i] + d * TARGET_ATR * atr[i],
+                      "type": df["kind"].iat[i]}
             break
         e = i + 1
-        entry, stop = o[e], o[e] - d * STOP_ATR * atr[i]
+        entry = o[e]
+        stop, target = entry - d * STOP_ATR * atr[i], entry + d * TARGET_ATR * atr[i]
         exit_i = exit_px = reason = None
         for j in range(e, complete):
-            if (d == 1 and l[j] <= stop) or (d == -1 and h[j] >= stop):
+            if (d == 1 and l[j] <= stop) or (d == -1 and h[j] >= stop):        # stop checked first
                 exit_i, exit_px, reason = j, (min(o[j], stop) if d == 1 else max(o[j], stop)), "stop"
-            elif (d == 1 and c[j] > ma[j]) or (d == -1 and c[j] < ma[j]):
-                exit_i, exit_px, reason = j, c[j], "target"
+            elif (d == 1 and h[j] >= target) or (d == -1 and l[j] <= target):  # intraday take-profit
+                gap = o[j] if j > e else target                                 # gapped through it
+                exit_i, exit_px, reason = j, (max(gap, target) if d == 1 else min(gap, target)), "target"
+            elif d * (c[j] - entry) > 0:                                        # first close in profit
+                exit_i, exit_px, reason = j, c[j], "profit close"
             elif setup[j] == -d:                       # opposite signal: close here and reverse
                 exit_i, exit_px, reason = j, c[j], "reverse"
             elif j - e + 1 >= MAX_DAYS:
@@ -210,12 +212,12 @@ def simulate(df, complete):
             if exit_i is not None:
                 break
         t = {"dir": d, "type": df["kind"].iat[i], "signal_date": df.index[i], "entry_date": df.index[e],
-             "entry": entry, "stop": stop}
+             "entry": entry, "stop": stop, "target": target}
         if exit_i is None:                          # still open
             t.update(exit_date=None, exit=c[complete - 1], reason="open", days=complete - e,
                      ret=100 * d * (c[complete - 1] - entry) / entry)
             trades.append(t)
-            status = {"kind": "open", **t, "ma": ma[complete - 1]}
+            status = {"kind": "open", **t}
             break
         t.update(exit_date=df.index[exit_i], exit=exit_px, reason=reason, days=exit_i - e + 1,
                  ret=100 * (d * (exit_px - entry) / entry - 2 * COST_PCT))
@@ -254,14 +256,16 @@ def print_report(df, trades, status, live, symbol):
         when = "today's open" if live is not None else "the next open"
         print(f"\n  >>> NEW {side[d]} SIGNAL [{status['type']}] (close of {status['date'].date()}) — "
               f"{'buy' if d == 1 else 'sell short'} at {when} (~{status['close']:,.2f})")
-        print(f"      stop ~{status['stop']:,.2f}   exit on the first close {'above' if d == 1 else 'below'} "
-              f"the {EXIT_MA}-day average, max {MAX_DAYS} days")
+        print(f"      take-profit limit = entry {'+' if d == 1 else '-'} {TARGET_ATR * status['atr']:,.2f} "
+              f"(~{status['target']:,.2f} if filled near {status['close']:,.2f})")
+        print(f"      stop = entry {'-' if d == 1 else '+'} {STOP_ATR * status['atr']:,.2f} (~{status['stop']:,.2f})   "
+              f"else exit on the first close in profit, max {MAX_DAYS} days")
     elif k == "open":
         d = status["dir"]
         print(f"\n  >>> IN {side[d]} since {status['entry_date'].date()} @ {status['entry']:,.2f}   "
               f"P/L {status['ret']:+.2f}%   day {status['days']} of {MAX_DAYS}")
-        print(f"      stop {status['stop']:,.2f}   exit on a close {'above' if d == 1 else 'below'} "
-              f"{status['ma']:,.2f} ({EXIT_MA}-day average)")
+        print(f"      take-profit limit {status['target']:,.2f}   stop {status['stop']:,.2f}   "
+              f"or exit on a close {'above' if d == 1 else 'below'} {status['entry']:,.2f}")
     else:
         print("\n  >>> NO SIGNAL — stay flat.")
         if last.Close > last.ma200:
@@ -277,11 +281,14 @@ def print_report(df, trades, status, live, symbol):
         if k == "open":
             d = status["dir"]
             if (r.Low <= status["stop"]) if d == 1 else (r.High >= status["stop"]):
-                print("      stop hit today — the trade is closed.")
-            elif (r.Close > r.ma_exit) if d == 1 else (r.Close < r.ma_exit):
-                print("      exit condition met — plan to close at today's close.")
+                print("      STOP hit today — the trade is closed.")
+            elif (r.High >= status["target"]) if d == 1 else (r.Low <= status["target"]):
+                print(f"      TARGET {status['target']:,.2f} reached today — take the profit.")
+            elif d * (r.Close - status["entry"]) > 0:
+                print(f"      in profit now — if it stays {'above' if d == 1 else 'below'} {status['entry']:,.2f} "
+                      f"into the close, exit at the close.")
             else:
-                print("      hold — exit condition not met yet.")
+                print(f"      hold — target {status['target']:,.2f}, stop {status['stop']:,.2f}.")
         elif r.setup != 0:
             print(f"      {side[int(r.setup)]} signal FORMING [{r.kind}] — valid only if it still holds at the close.")
         else:
@@ -290,6 +297,9 @@ def print_report(df, trades, status, live, symbol):
     months = max((df.index[-1] - df.index[0]).days / 30.4, 1)
     print(f"\n  Track record, mode '{MODE}', {df.index[0].date()} -> {df.index[-1].date()} "
           f"(enter next open, costs included) — about {len(trades) / months:.1f} signals per month:")
+    fin = trades[trades["reason"] != "open"] if not trades.empty else trades
+    if not fin.empty:
+        print(f"  ALL   {len(fin):4d} trades   win {100 * (fin['ret'] > 0).mean():5.1f}%")
     for line in summary(trades):
         print(line)
     done = trades[trades["reason"] != "open"].tail(10) if not trades.empty else trades
