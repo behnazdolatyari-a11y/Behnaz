@@ -16,6 +16,8 @@
 #   signal type did over the previous 3 years. Types that were losing (win rate < 50% or profit
 #   factor < 1.0) are blocked — but if every type is losing, the best one stays on, so you always
 #   get signals. Only past results are used at every point — no hindsight.
+#   On the chart: SOLID arrows = signals to trade. HOLLOW arrows = weak signals (their type has been
+#   losing) — shown so you can see every LONG and SHORT setup, but not traded.
 #
 #   MODE sets how many signals you get (the track record shows how each mode did):
 #     "quality"  : RSI(2) < 10 / > 90 only            — a handful per month at most
@@ -67,6 +69,7 @@ CHECK_LOOKBACK = 756        # ~3 years of trading days
 CHECK_MIN_TRADES = 15       # need at least this many past signals of the type to judge it
 CHECK_MIN_WIN = 0.50        # past win rate needed
 CHECK_MIN_PF = 1.0          # past profit factor needed (1.0 = broke even)
+SHOW_WEAK = True            # also draw blocked (weak) signals as hollow arrows
 COST_PCT = 0.0002           # commission + slippage per side
 
 CHART_DAYS = 126            # ~6 months on the chart
@@ -375,6 +378,11 @@ def print_report(df, trades, status, live, symbol):
               f"{lvl:,.2f}")
     else:
         print("\n  >>> NO SIGNAL — stay flat.")
+    n_done = len(df) - (1 if live is not None else 0)
+    last = df.iloc[n_done - 1]
+    if k != "new" and last.setup != 0 and not last.allowed:
+        print(f"      (weak {side[int(last.setup)]} setup at the last close [{last.kind}] — skipped: "
+              f"this type has been losing; hollow arrow on the chart)")
 
     if live is not None:
         r = df.iloc[-1]
@@ -390,6 +398,8 @@ def print_report(df, trades, status, live, symbol):
                 print("      hold — exit condition not met yet.")
         elif r.setup != 0 and r.allowed:
             print(f"      {side[int(r.setup)]} signal FORMING [{r.kind}] — valid only if it still holds at the close.")
+        elif r.setup != 0:
+            print(f"      weak {side[int(r.setup)]} setup forming [{r.kind}] — this type has been losing, not traded.")
         else:
             print("      no signal forming.")
 
@@ -449,6 +459,26 @@ def plot_chart(df, trades, status, live, symbol, html_path=HTML_PATH, show=True)
             textfont=dict(size=12, color=color),
             marker=dict(symbol=sym, size=12, color=color, line=dict(width=1, color="white")),
             hovertemplate=[f"<b>{name}</b> signal {q[0].date()}<br>{q[3]}<extra></extra>" for q in p]))
+
+    if SHOW_WEAK:                                    # blocked signals: hollow, first day of each streak
+        n_done = len(df) - (1 if live is not None else 0)
+        weak = (v["setup"] != 0) & ~v["allowed"] & (v["setup"] != v["setup"].shift())
+        weak &= np.arange(len(v)) < n_done - (len(df) - len(v))
+        stats = {k: _grade(ex, r, n_done) for k, (ex, r) in df.attrs.get("done", {}).items()}
+        for d, name, sym, color in ((1, "LONG (weak)", "triangle-up-open", LONG_COLOR),
+                                    (-1, "SHORT (weak)", "triangle-down-open", SHORT_COLOR)):
+            w = v[weak & (v["setup"] == d)]
+            if w.empty:
+                continue
+            y = w["Low"] - 0.6 * w["atr"] if d == 1 else w["High"] + 0.6 * w["atr"]
+            hover = []
+            for t, k in zip(w.index, w["kind"]):
+                g = stats.get(k)
+                why = f"profit factor {g[1]:.2f} over the last 3 years" if g else "not enough history"
+                hover.append(f"<b>{k}</b> (weak) {t.date()}<br>blocked: this type has been losing<br>{why}"
+                             f"<extra></extra>")
+            fig.add_trace(go.Scatter(x=w.index, y=y, mode="markers", name=name, hovertemplate=hover,
+                                     marker=dict(symbol=sym, size=11, color=color, line=dict(width=1.5))))
 
     missing = pd.bdate_range(v.index[0], v.index[-1]).difference(v.index)
     fig.update_layout(
